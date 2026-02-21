@@ -1,7 +1,10 @@
 """
-Text normalization module for TTS processing.
+Text normalization module for TTS processing — forked from Kokoro-FastAPI v0.2.4.
 Handles various text formats including URLs, emails, numbers, money, and special characters.
 Converts them into a format suitable for text-to-speech processing.
+
+Upstream: https://github.com/remsky/Kokoro-FastAPI/blob/v0.2.4/api/src/services/text_processing/normalizer.py
+Delta: handle_markdown() function + markdown_normalization toggle in normalize_text()
 """
 
 import math
@@ -186,6 +189,101 @@ NUMBER_PATTERN = re.compile(
     r"(-?)(\d+(?:\.\d+)?)((?: hundred| thousand| (?:[bm]|tr|quadr)illion|k|m|b)*)\b",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Markdown normalization patterns (added by navi-os fork)
+# ---------------------------------------------------------------------------
+# Order matters: fenced code blocks first, then inline, then structural.
+# Bold before italic to avoid partial matches on **.
+_MD_FENCED_CODE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_MD_INLINE_CODE = re.compile(r"`([^`]+)`")
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+# Italic with * — only match when not preceded/followed by word chars to avoid
+# false positives inside URLs or filenames.
+_MD_ITALIC_STAR = re.compile(r"(?<!\w)\*(.+?)\*(?!\w)")
+# Italic with _ — word-boundary-aware so snake_case stays intact.
+_MD_ITALIC_UNDER = re.compile(r"(?<!\w)_(.+?)_(?!\w)")
+_MD_STRIKETHROUGH = re.compile(r"~~(.+?)~~")
+_MD_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
+_MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
+_MD_UNORDERED_LIST = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
+_MD_ORDERED_LIST = re.compile(r"^(\s*)\d+\.\s+", re.MULTILINE)
+# Table separator rows like |---|---|
+_MD_TABLE_SEP_ROW = re.compile(r"^\s*\|?[\s:]*-{3,}[\s:|-]*\|?\s*$", re.MULTILINE)
+
+
+def handle_markdown(text: str) -> str:
+    """Strip markdown formatting so TTS reads content, not syntax.
+
+    Designed as a pre-processing pass: runs BEFORE email/URL normalization
+    so that markdown link syntax ``[text](url)`` is reduced to ``text``
+    before the URL handler sees bare URLs.
+    """
+    # --- Phase 1: Protect code content from markdown stripping ---
+    # Extract fenced code blocks and inline code into placeholders so that
+    # markdown syntax inside code (e.g. **bold**) is preserved literally.
+    code_blocks: list[str] = []
+
+    def _save_fenced(m: re.Match) -> str:
+        code_blocks.append(m.group(1))
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = _MD_FENCED_CODE.sub(_save_fenced, text)
+
+    inline_codes: list[str] = []
+
+    def _save_inline(m: re.Match) -> str:
+        inline_codes.append(m.group(1))
+        return f"\x00IC{len(inline_codes) - 1}\x00"
+
+    text = _MD_INLINE_CODE.sub(_save_inline, text)
+
+    # --- Phase 2: Strip markdown formatting ---
+    # Images — keep alt text
+    text = _MD_IMAGE.sub(r"\1", text)
+    # Links — keep link text
+    text = _MD_LINK.sub(r"\1", text)
+    # Bold (** before * to avoid partial match)
+    text = _MD_BOLD.sub(r"\1", text)
+    # Italic (* and _)
+    text = _MD_ITALIC_STAR.sub(r"\1", text)
+    text = _MD_ITALIC_UNDER.sub(r"\1", text)
+    # Strikethrough
+    text = _MD_STRIKETHROUGH.sub(r"\1", text)
+    # Headings — strip leading hashes
+    text = _MD_HEADING.sub("", text)
+    # Blockquotes — strip leading >
+    text = _MD_BLOCKQUOTE.sub("", text)
+    # Horizontal rules — remove entire line
+    text = _MD_HORIZONTAL_RULE.sub("", text)
+    # List markers — strip marker, keep text
+    text = _MD_UNORDERED_LIST.sub(r"\1", text)
+    text = _MD_ORDERED_LIST.sub(r"\1", text)
+    # Table separator rows — remove entirely
+    text = _MD_TABLE_SEP_ROW.sub("", text)
+    # Table pipes — only replace on lines that look like table rows (2+ pipes).
+    # This preserves non-table pipes like "true | false".
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.count("|") >= 2:
+            lines[i] = line.replace("|", " ")
+    text = "\n".join(lines)
+
+    # --- Phase 3: Restore protected code content ---
+    for idx, content in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{idx}\x00", content)
+    for idx, content in enumerate(inline_codes):
+        text = text.replace(f"\x00IC{idx}\x00", content)
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Upstream handlers (unchanged from v0.2.4)
+# ---------------------------------------------------------------------------
 
 INFLECT_ENGINE = inflect.engine()
 
@@ -408,7 +506,14 @@ def handle_time(t: re.Match[str]) -> str:
 
 def normalize_text(text: str, normalization_options: NormalizationOptions) -> str:
     """Normalize text for TTS processing"""
-    
+
+    # Handle markdown formatting FIRST — strips syntax like **bold**, [link](url),
+    # ```code```, etc. before other handlers see the raw symbols.
+    # Must run before email/URL normalization: markdown links contain URLs that
+    # should be reduced to link text, not spelled out.
+    if normalization_options.markdown_normalization:
+        text = handle_markdown(text)
+
     # Handle email addresses first if enabled
     if normalization_options.email_normalization:
         text = EMAIL_PATTERN.sub(handle_email, text)
@@ -457,7 +562,7 @@ def normalize_text(text: str, normalization_options: NormalizationOptions) -> st
     # Replace newlines with spaces (or pauses if needed)
     text = text.replace('\n', ' ')
     text = text.replace('\r', ' ')
-    
+
     # Handle titles and abbreviations
     text = re.sub(r"\bD[Rr]\.(?= [A-Z])", "Doctor", text)
     text = re.sub(r"\b(?:Mr\.|MR\.(?= [A-Z]))", "Mister", text)
@@ -497,4 +602,4 @@ def normalize_text(text: str, normalization_options: NormalizationOptions) -> st
 
     text = re.sub(r"\s{2,}", " ", text)
 
-    return text
+    return text.strip()
