@@ -1,192 +1,121 @@
-name: Create Release and Publish Docker Images
+# Fieldnote-Echo/Kokoro-FastAPI — Hardened GHCR Release
+# Replaces upstream's multi-arch bake workflow with a GPU-only, amd64-only
+# build that includes supply-chain hardening (pinned actions, Sigstore
+# attestation, Trivy scan, CycloneDX SBOM).
+#
+# Triggers: tag push (v*) or manual dispatch.
+
+name: Release GPU Image
 
 on:
   push:
-    branches:
-      - release # Auto-trigger only on release branch
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-  workflow_dispatch: # Manual trigger - explicitly specify branch
-    inputs:
-      branch_name:
-        description: 'Branch to build from (required)'
-        required: true
-        type: string
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # GitHub Release creation
+  packages: write        # GHCR push
+  id-token: write        # Sigstore OIDC
+  security-events: write # SARIF upload
+  attestations: write    # Build provenance
 
 jobs:
-  prepare-release:
+  build-and-release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get-version.outputs.version }}
-      version_tag: ${{ steps.get-version.outputs.version_tag }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Get version from VERSION file
-        id: get-version
-        run: |
-          VERSION_PLAIN=$(cat VERSION)
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            BRANCH_NAME="${{ inputs.branch_name }}"
-          else
-            BRANCH_NAME="${{ github.ref_name }}"
-          fi
-
-          if [[ "$BRANCH_NAME" == "release" ]]; then
-            echo "version=${VERSION_PLAIN}" >> $GITHUB_OUTPUT
-            echo "version_tag=v${VERSION_PLAIN}" >> $GITHUB_OUTPUT
-          else
-            SAFE_BRANCH=$(echo "$BRANCH_NAME" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-            echo "version=${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
-            echo "version_tag=v${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
-          fi
-
-  build-images:
-    needs: prepare-release
-    permissions:
-      packages: write
     env:
-      DOCKER_BUILDKIT: 1
-      BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
-      VERSION: ${{ needs.prepare-release.outputs.version_tag }}
-      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
-      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
-    strategy:
-      matrix:
-        include:
-          - build_target: "cpu"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-latest"
-          - build_target: "gpu"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-latest"
-          - build_target: "cpu"
-            platform: "linux/arm64"
-            runs_on: "ubuntu-24.04-arm"
-          - build_target: "gpu"
-            platform: "linux/arm64"
-            runs_on: "ubuntu-24.04-arm"
-          - build_target: "rocm"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-latest"
-    runs-on: ${{ matrix.runs_on }}
+      IMAGE: ghcr.io/fieldnote-echo/kokoro-fastapi-gpu
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # ── Runner hardening ──────────────────────────────────────────────
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
         with:
-          fetch-depth: 0 # Needed to check for existing tags
+          egress-policy: audit
 
-      - name: Check if tag already exists
-        run: |
-          TAG_NAME="${{ needs.prepare-release.outputs.version_tag }}"
-          echo "Checking for existing tag: $TAG_NAME"
-          git fetch --tags
-          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-            echo "::error::Tag $TAG_NAME already exists. Please increment the version in the VERSION file."
-            exit 1
-          else
-            echo "Tag $TAG_NAME does not exist. Proceeding with release."
-          fi
+      # ── Checkout ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # ── Free disk space (CUDA images are ~12 GB) ──────────────────────
       - name: Free disk space
         run: |
-          echo "Listing current disk space"
-          df -h
-          echo "Cleaning up disk space..."
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           docker system prune -af
-          echo "Disk space after cleanup"
-          df -h
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3 # Use v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-            network=host
+      # ── Docker Buildx ─────────────────────────────────────────────────
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3 # Use v3
+      # ── GHCR login ────────────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push single-platform image
-        run: |
-          PLATFORM="${{ matrix.platform }}"
-          BUILD_TARGET="${{ matrix.build_target }}"
-          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
-
-          echo "Building ${PLATFORM} image for ${BUILD_TARGET} version ${VERSION_TAG}"
-
-          TARGET="${BUILD_TARGET}-$(echo ${PLATFORM} | cut -d'/' -f2)"
-          echo "Using bake target: $TARGET"
-
-          docker buildx bake $TARGET --push --progress=plain
-
-  create-manifests:
-    needs: [prepare-release, build-images]
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    env:
-      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
-      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
-    strategy:
-      matrix:
-        build_target: ["cpu", "gpu", "rocm"]
-    steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      # ── Image metadata (semver tags + latest) ─────────────────────────
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
 
-      - name: Create multi-platform manifest
-        run: |
-          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
-          TARGET="${{ matrix.build_target }}"
-          REGISTRY="${{ env.REGISTRY }}"
-          OWNER="${{ env.OWNER }}"
-          REPO="${{ env.REPO }}"
-
-          docker buildx imagetools create -t \
-            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG} \
-            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-amd64 \
-            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-arm64
-
-          if [[ "$VERSION_TAG" != *"-"* ]]; then
-            docker buildx imagetools create -t \
-              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:latest \
-              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-amd64 \
-              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-arm64
-          fi
-
-  create-release:
-    needs: [prepare-release, create-manifests]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # ── Build & push ──────────────────────────────────────────────────
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          fetch-depth: 0
+          context: .
+          file: docker/gpu/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+      # ── Sigstore build provenance ─────────────────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── Trivy container scan ──────────────────────────────────────────
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ── CycloneDX SBOM ───────────────────────────────────────────────
+      - name: Generate SBOM
+        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      # ── GitHub Release ────────────────────────────────────────────────
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.version_tag }}
-          name: Release ${{ needs.prepare-release.outputs.version_tag }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+        if: startsWith(github.ref, 'refs/tags/')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes \
+            sbom.cdx.json
