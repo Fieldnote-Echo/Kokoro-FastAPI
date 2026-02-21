@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM nvcr.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+FROM --platform=$BUILDPLATFORM nvcr.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:1cb02388491c05441f8963d42bc38b6ec5462fba95a8e3bb2cb8e6091f0738c8
 
 # Install Python and other dependencies
 RUN apt-get update -y &&  \
