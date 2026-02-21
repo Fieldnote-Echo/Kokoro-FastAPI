@@ -1,3 +1,12 @@
+> **Fieldnote-Echo fork** of [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) (currently based on `v0.6.0`)
+>
+> **What this fork adds:**
+> - **Markdown-aware TTS normalization** — strips `**bold**`, `[links](url)`, headings, code blocks, tables, etc. before synthesis so LLM output sounds natural (toggle: `markdown_normalization` in `NormalizationOptions`, default on)
+> - **Supply-chain hardened CI** — CUDA base images pinned by digest (in `docker-bake.hcl` and the release workflow), all GitHub Actions pinned to SHA, Sigstore build provenance, Trivy container scan, CycloneDX SBOM on every release
+> - **GHCR images** — `ghcr.io/fieldnote-echo/kokoro-fastapi-gpu` (GPU, amd64)
+>
+> Everything else is upstream. We rebase on `remsky/master` periodically.
+
 <p align="center">
   <img src="githubbanner.png" alt="Kokoro TTS Banner">
 </p>
