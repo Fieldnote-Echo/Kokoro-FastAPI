@@ -1,4 +1,9 @@
-from email.policy import default
+"""Kokoro-FastAPI schemas — forked from upstream to add markdown_normalization toggle.
+
+Upstream: https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/structures/schemas.py
+Delta: NormalizationOptions.markdown_normalization field (default True)
+"""
+
 from enum import Enum
 from typing import List, Literal, Optional, Union
 
@@ -47,6 +52,11 @@ class NormalizationOptions(BaseModel):
     normalize: bool = Field(
         default=True,
         description="Normalizes input text to make it easier for the model to say",
+    )
+    markdown_normalization: bool = Field(
+        default=True,
+        description="Strips markdown formatting for cleaner TTS output "
+        "(e.g., **bold** -> bold, [link](url) -> link)",
     )
     unit_normalization: bool = Field(
         default=False, description="Transforms units like 10KB to 10 kilobytes"
