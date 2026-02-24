@@ -47,6 +47,9 @@ _TRIPLE_NEWLINE = re.compile(r"\n{3,}")
 
 _SENTINEL = "\x00SECTION_BREAK\x00"
 
+# Markdown heading: 1-6 leading '#' followed by space and text
+_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$")
+
 
 def annotate(text: str) -> list[NarrativeSegment]:
     """Analyze raw text and produce an annotated segment stream.
@@ -58,6 +61,7 @@ def annotate(text: str) -> list[NarrativeSegment]:
         return []
 
     segments = _split_sections_and_paragraphs(text)
+    segments = _detect_headings(segments)
     return segments
 
 
@@ -145,3 +149,43 @@ def _split_sections_and_paragraphs(text: str) -> list[NarrativeSegment]:
         segments.append(NarrativeSegment(text=stripped, annotations=annotations))
 
     return segments
+
+
+def _detect_headings(segments: list[NarrativeSegment]) -> list[NarrativeSegment]:
+    """Detect markdown headings and add before/after pause annotations.
+
+    Heading text has the ``# `` prefix stripped and receives two annotations:
+    a *before* annotation (with ``force_chunk_boundary=True``) and an *after*
+    annotation for the trailing pause.
+    """
+    result: list[NarrativeSegment] = []
+    for seg in segments:
+        m = _HEADING_PATTERN.match(seg.text)
+        if m:
+            level = len(m.group(1))
+            heading_text = m.group(2).strip()
+            # Preserve any existing annotations (e.g., paragraph_break from
+            # a heading that follows another paragraph).
+            annotations = list(seg.annotations)
+            annotations.append(
+                NarrativeAnnotation(
+                    kind="heading",
+                    pause_s=_settings.narrative_heading_before_pause,
+                    position="before",
+                    force_chunk_boundary=True,
+                    metadata={"level": level},
+                )
+            )
+            annotations.append(
+                NarrativeAnnotation(
+                    kind="heading",
+                    pause_s=_settings.narrative_heading_after_pause,
+                    position="after",
+                    force_chunk_boundary=False,
+                    metadata={"level": level},
+                )
+            )
+            result.append(NarrativeSegment(text=heading_text, annotations=annotations))
+        else:
+            result.append(seg)
+    return result

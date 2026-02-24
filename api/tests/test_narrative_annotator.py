@@ -190,3 +190,55 @@ def test_annotate_preserves_text_content():
     segments = annotate("  Indented text.  \n\nSecond paragraph.")
     assert segments[0].text == "Indented text."
     assert segments[1].text == "Second paragraph."
+
+
+# ---------------------------------------------------------------------------
+# Task 4: annotate() — heading detection
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_heading():
+    """Markdown heading produces heading annotations (before + after)."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("# Chapter One\n\nThe story begins.")
+    assert len(segments) == 2
+
+    heading = segments[0]
+    assert heading.text == "Chapter One"
+    before_anns = [a for a in heading.annotations if a.position == "before"]
+    after_anns = [a for a in heading.annotations if a.position == "after"]
+    assert len(before_anns) == 1
+    assert before_anns[0].kind == "heading"
+    assert before_anns[0].force_chunk_boundary is True
+    assert len(after_anns) == 1
+    assert after_anns[0].kind == "heading"
+    assert after_anns[0].pause_s > 0
+
+    body = segments[1]
+    assert body.text == "The story begins."
+
+
+def test_annotate_heading_levels():
+    """Different heading levels are captured in metadata."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("## Section Title\n\nContent.")
+    heading = segments[0]
+    before = [a for a in heading.annotations if a.position == "before"][0]
+    assert before.metadata.get("level") == 2
+
+
+def test_annotate_heading_not_first_segment():
+    """Heading after body text gets both heading + paragraph annotations."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("Intro text.\n\n## Next Section\n\nMore text.")
+    assert len(segments) == 3
+    heading = segments[1]
+    assert heading.text == "Next Section"
+    kinds = {a.kind for a in heading.annotations}
+    assert "heading" in kinds
