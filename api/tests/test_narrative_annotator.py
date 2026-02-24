@@ -470,3 +470,61 @@ async def test_annotated_text_flows_through_smart_split():
     pause_chunks = [c for c in chunks if c[2] is not None]
     assert len(text_chunks) >= 2
     assert len(pause_chunks) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Task 8: Regression and edge case tests
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_preserves_existing_pause_tags():
+    """Explicit [pause:Xs] tags in input text pass through untouched."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    text = "Before pause. [pause:2.0s] After pause."
+    segments = annotate(text)
+    tagged = segments_to_tagged_text(segments)
+    assert "[pause:2.0s]" in tagged
+
+
+def test_annotate_all_headings_no_body():
+    """Document of only headings doesn't crash."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("# Title\n\n## Subtitle\n\n### Sub-subtitle")
+    assert len(segments) == 3
+    assert all(
+        any(a.kind == "heading" for a in s.annotations)
+        for s in segments
+    )
+
+
+def test_annotate_novel_excerpt():
+    """Real prose from a novel annotates correctly."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    excerpt = (
+        "Komako noticed the salt was wrong on a Tuesday.\n\n"
+        "Not wrong in any way she could explain to her husband, "
+        "who would have looked at her over his reading glasses and said "
+        "\u201cit\u2019s salt, Komako,\u201d in that tone he used for things "
+        "he considered beneath the dignity of language.\n\n"
+        "She put the salt down and went about her morning."
+    )
+
+    segments = annotate(excerpt)
+    tagged = segments_to_tagged_text(segments)
+
+    # Should have paragraph pauses
+    assert "[pause:" in tagged
+    # Should have 3+ text segments (3 paragraphs, possibly split by dialogue)
+    text_segments = [s for s in segments if s.text.strip()]
+    assert len(text_segments) >= 3
+    # Second paragraph should have dialogue detected
+    dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
+    assert len(dialogue_segs) >= 1
