@@ -102,3 +102,91 @@ def test_heading_has_before_and_after_annotations():
     assert len(after) == 1
     assert before[0].pause_s == 1.0
     assert after[0].pause_s == 0.8
+
+
+# ---------------------------------------------------------------------------
+# Task 3: annotate() — section and paragraph detection
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_single_paragraph():
+    """Single paragraph produces one segment with no annotations."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("Just a single paragraph.")
+    assert len(segments) == 1
+    assert segments[0].text == "Just a single paragraph."
+    assert segments[0].annotations == []
+
+
+def test_annotate_two_paragraphs():
+    """Double newline produces paragraph_break annotation on second segment."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("First paragraph.\n\nSecond paragraph.")
+    assert len(segments) == 2
+    assert segments[0].text == "First paragraph."
+    assert segments[0].annotations == []
+    assert segments[1].text == "Second paragraph."
+    assert len(segments[1].annotations) == 1
+    assert segments[1].annotations[0].kind == "paragraph_break"
+    assert segments[1].annotations[0].position == "before"
+
+
+def test_annotate_section_break_dashes():
+    """Triple dashes produce section_break annotation."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("Before section.\n\n---\n\nAfter section.")
+    text_segments = [s for s in segments if s.text.strip()]
+    assert len(text_segments) == 2
+    after = text_segments[1]
+    section_anns = [a for a in after.annotations if a.kind == "section_break"]
+    assert len(section_anns) == 1
+    assert section_anns[0].pause_s >= 1.0
+
+
+def test_annotate_section_break_asterisks():
+    """Triple asterisks produce section_break annotation."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("Before.\n\n***\n\nAfter.")
+    text_segments = [s for s in segments if s.text.strip()]
+    assert len(text_segments) == 2
+    section_anns = [a for a in text_segments[1].annotations if a.kind == "section_break"]
+    assert len(section_anns) == 1
+
+
+def test_annotate_triple_newline_as_section_break():
+    """Three or more newlines produce section_break instead of paragraph_break."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("Before.\n\n\n\nAfter.")
+    text_segments = [s for s in segments if s.text.strip()]
+    assert len(text_segments) == 2
+    ann = text_segments[1].annotations[0]
+    assert ann.kind == "section_break"
+
+
+def test_annotate_empty_input():
+    """Empty input produces empty segment list."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    assert annotate("") == []
+    assert annotate("   ") == []
+
+
+def test_annotate_preserves_text_content():
+    """Annotation strips leading/trailing whitespace from segments."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("  Indented text.  \n\nSecond paragraph.")
+    assert segments[0].text == "Indented text."
+    assert segments[1].text == "Second paragraph."
