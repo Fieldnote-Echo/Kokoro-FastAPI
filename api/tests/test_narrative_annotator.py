@@ -302,3 +302,72 @@ def test_annotate_no_dialogue_in_plain_text():
     segments = annotate("The salt was heavy. She put it down.")
     dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
     assert len(dialogue_segs) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 6: segments_to_tagged_text()
+# ---------------------------------------------------------------------------
+
+
+def test_segments_to_tagged_text_simple():
+    """Two paragraphs produce text with pause tag between them."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    segments = annotate("First paragraph.\n\nSecond paragraph.")
+    tagged = segments_to_tagged_text(segments)
+    assert "First paragraph." in tagged
+    assert "[pause:" in tagged
+    assert "Second paragraph." in tagged
+
+
+def test_segments_to_tagged_text_section_break():
+    """Section break produces longer pause than paragraph break."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    segments = annotate("Before.\n\n---\n\nAfter.")
+    tagged = segments_to_tagged_text(segments)
+    import re as _re
+    pauses = _re.findall(r"\[pause:([\d.]+)s\]", tagged)
+    assert len(pauses) >= 1
+    assert float(pauses[0]) >= 1.0
+
+
+def test_segments_to_tagged_text_heading():
+    """Heading gets pause before and after."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    segments = annotate("# Title\n\nBody text.")
+    tagged = segments_to_tagged_text(segments)
+    import re as _re
+    pauses = _re.findall(r"\[pause:([\d.]+)s\]", tagged)
+    assert len(pauses) >= 2
+
+
+def test_segments_to_tagged_text_no_leading_pause():
+    """First segment doesn't get a leading pause."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    segments = annotate("# Title\n\nBody.")
+    tagged = segments_to_tagged_text(segments)
+    assert not tagged.lstrip().startswith("[pause:")
+
+
+def test_segments_to_tagged_text_plain_text_unchanged():
+    """Plain text without structure passes through unchanged."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    text = "Just a simple sentence with no structure."
+    segments = annotate(text)
+    tagged = segments_to_tagged_text(segments)
+    assert tagged.strip() == text.strip()
+    assert "[pause:" not in tagged

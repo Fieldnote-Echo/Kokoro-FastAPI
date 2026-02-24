@@ -276,3 +276,54 @@ def _detect_dialogue_and_asides(
         segments, _ASIDE_PATTERN, "aside", skip_kinds=("heading", "dialogue")
     )
     return segments
+
+
+def segments_to_tagged_text(segments: list[NarrativeSegment]) -> str:
+    """Convert annotated segments back to a string with ``[pause:Xs]`` tags.
+
+    Pause collision resolution uses **max()** semantics: when multiple "before"
+    pauses coincide on the same segment boundary, only the longest pause is
+    emitted.  A ``force_chunk_boundary`` without any associated pause inserts a
+    minimal ``[pause:0.001s]`` tag so the downstream chunker still splits there.
+
+    No leading pause is emitted before the very first text segment.
+    """
+    if not segments:
+        return ""
+
+    parts: list[str] = []
+    is_first_text = True
+
+    for segment in segments:
+        if not segment.text.strip():
+            continue
+
+        before_pauses = [
+            a.pause_s for a in segment.annotations
+            if a.position == "before" and a.pause_s > 0
+        ]
+        has_chunk_boundary = any(
+            a.force_chunk_boundary for a in segment.annotations if a.position == "before"
+        )
+
+        if not is_first_text:
+            if before_pauses:
+                max_pause = max(before_pauses)
+                parts.append(f" [pause:{max_pause}s] ")
+            elif has_chunk_boundary:
+                parts.append(" [pause:0.001s] ")
+            else:
+                parts.append(" ")
+
+        parts.append(segment.text)
+        is_first_text = False
+
+        after_pauses = [
+            a.pause_s for a in segment.annotations
+            if a.position == "after" and a.pause_s > 0
+        ]
+        if after_pauses:
+            max_pause = max(after_pauses)
+            parts.append(f" [pause:{max_pause}s] ")
+
+    return "".join(parts).strip()
