@@ -50,6 +50,14 @@ _SENTINEL = "\x00SECTION_BREAK\x00"
 # Markdown heading: 1-6 leading '#' followed by space and text
 _HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$")
 
+# Dialogue: straight double-quoted or curly double-quoted text
+_DIALOGUE_PATTERN = re.compile(
+    r'("(?:[^"\\]|\\.)*"'
+    r'|\u201c(?:[^\u201d\\]|\\.)*\u201d)',
+)
+# Aside: parenthetical text
+_ASIDE_PATTERN = re.compile(r"(\([^)]+\))")
+
 
 def annotate(text: str) -> list[NarrativeSegment]:
     """Analyze raw text and produce an annotated segment stream.
@@ -62,6 +70,7 @@ def annotate(text: str) -> list[NarrativeSegment]:
 
     segments = _split_sections_and_paragraphs(text)
     segments = _detect_headings(segments)
+    segments = _detect_dialogue_and_asides(segments)
     return segments
 
 
@@ -189,3 +198,81 @@ def _detect_headings(segments: list[NarrativeSegment]) -> list[NarrativeSegment]
         else:
             result.append(seg)
     return result
+
+
+def _split_on_pattern(
+    segments: list[NarrativeSegment],
+    pattern: re.Pattern[str],
+    kind: str,
+    skip_kinds: tuple[str, ...] = ("heading",),
+) -> list[NarrativeSegment]:
+    """Split segments on *pattern*, annotating matched spans with *kind*.
+
+    For each segment that is NOT annotated with a kind in *skip_kinds*, we
+    search for *pattern* matches.  When a match is found mid-text the segment
+    is split into up to three sub-segments: text before the match, the matched
+    span (annotated), and text after the match.  The original segment's
+    annotations are carried only on the first sub-segment.
+    """
+    result: list[NarrativeSegment] = []
+    for seg in segments:
+        # Skip segments already annotated with any of the skip_kinds.
+        if any(a.kind in skip_kinds for a in seg.annotations):
+            result.append(seg)
+            continue
+
+        text = seg.text
+        parts: list[NarrativeSegment] = []
+        last_end = 0
+        first_sub = True
+
+        for m in pattern.finditer(text):
+            start, end = m.start(), m.end()
+            # Text before the match
+            before_text = text[last_end:start].strip()
+            if before_text:
+                anns = list(seg.annotations) if first_sub else []
+                parts.append(NarrativeSegment(text=before_text, annotations=anns))
+                first_sub = False
+
+            # The matched span itself, annotated
+            matched_text = m.group(0)
+            match_anns = list(seg.annotations) if first_sub else []
+            match_anns.append(
+                NarrativeAnnotation(
+                    kind=kind,
+                    pause_s=0.0,
+                    position="before",
+                    force_chunk_boundary=True,
+                )
+            )
+            parts.append(NarrativeSegment(text=matched_text, annotations=match_anns))
+            first_sub = False
+            last_end = end
+
+        if not parts:
+            # No matches — keep segment unchanged
+            result.append(seg)
+        else:
+            # Text after last match
+            remaining = text[last_end:].strip()
+            if remaining:
+                parts.append(NarrativeSegment(text=remaining, annotations=[]))
+            result.extend(parts)
+
+    return result
+
+
+def _detect_dialogue_and_asides(
+    segments: list[NarrativeSegment],
+) -> list[NarrativeSegment]:
+    """Detect dialogue (quoted text) and asides (parentheticals).
+
+    Dialogue detection runs FIRST so that parentheticals inside quotes are
+    preserved as part of the dialogue span rather than being split as asides.
+    """
+    segments = _split_on_pattern(segments, _DIALOGUE_PATTERN, "dialogue")
+    segments = _split_on_pattern(
+        segments, _ASIDE_PATTERN, "aside", skip_kinds=("heading", "dialogue")
+    )
+    return segments

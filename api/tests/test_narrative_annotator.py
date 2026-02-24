@@ -242,3 +242,63 @@ def test_annotate_heading_not_first_segment():
     assert heading.text == "Next Section"
     kinds = {a.kind for a in heading.annotations}
     assert "heading" in kinds
+
+
+# ---------------------------------------------------------------------------
+# Task 5: annotate() — dialogue and aside detection
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_dialogue_straight_quotes():
+    """Double-quoted text is split into dialogue segment."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate('She said "hello" and left.')
+    texts = [s.text for s in segments]
+    assert any('"hello"' in t for t in texts)
+    dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
+    assert len(dialogue_segs) == 1
+    assert dialogue_segs[0].annotations[-1].force_chunk_boundary is True
+
+
+def test_annotate_dialogue_curly_quotes():
+    """Curly-quoted text is split into dialogue segment."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("She said \u201chello\u201d and left.")
+    dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
+    assert len(dialogue_segs) == 1
+
+
+def test_annotate_aside_parenthetical():
+    """Parenthetical text is split into aside segment."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("He swept (as always) and oiled the bench.")
+    aside_segs = [s for s in segments if any(a.kind == "aside" for a in s.annotations)]
+    assert len(aside_segs) == 1
+    assert "(as always)" in aside_segs[0].text
+
+
+def test_annotate_dialogue_before_aside():
+    """Dialogue detection runs before aside — parenthetical inside quotes stays in dialogue."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate('She said "I told him (the one from Tuesday) to leave" and walked away.')
+    dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
+    assert len(dialogue_segs) == 1
+    assert "(the one from Tuesday)" in dialogue_segs[0].text
+
+
+def test_annotate_no_dialogue_in_plain_text():
+    """Text without quotes produces no dialogue annotations."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+
+    segments = annotate("The salt was heavy. She put it down.")
+    dialogue_segs = [s for s in segments if any(a.kind == "dialogue" for a in s.annotations)]
+    assert len(dialogue_segs) == 0
