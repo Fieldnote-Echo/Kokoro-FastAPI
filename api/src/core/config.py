@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     target_max_tokens: int = 250  # Target maximum tokens per chunk
     absolute_max_tokens: int = 450  # Absolute maximum tokens per chunk
     advanced_text_normalization: bool = True  # Preproesses the text before misiki
+
+    # Narrative Awareness Settings
+    narrative_paragraph_pause: float = 0.6     # Seconds of silence between paragraphs
+    narrative_section_pause: float = 1.2       # Seconds of silence at section breaks
+    narrative_heading_before_pause: float = 1.0  # Seconds of silence before headings
+    narrative_heading_after_pause: float = 0.8   # Seconds of silence after headings
+
     voice_weight_normalization: bool = (
         True  # Normalize the voice weights so they add up to 1
     )
