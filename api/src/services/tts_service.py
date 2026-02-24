@@ -21,6 +21,7 @@ from ..structures.schemas import NormalizationOptions
 from .audio import AudioNormalizer, AudioService
 from .streaming_audio_writer import StreamingAudioWriter
 from .text_processing import tokenize
+from .text_processing.narrative_annotator import annotate, segments_to_tagged_text
 from .text_processing.text_processor import process_text_chunk, smart_split
 
 
@@ -285,9 +286,13 @@ class TTSService:
                 f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream"
             )
 
+            # Annotate document structure before normalization destroys it
+            narrative_segments = annotate(text)
+            annotated_text = segments_to_tagged_text(narrative_segments)
+
             # Process text in chunks with smart splitting, handling pause tags
             async for chunk_text, tokens, pause_duration_s in smart_split(
-                text,
+                annotated_text,
                 lang_code=pipeline_lang_code,
                 normalization_options=normalization_options,
             ):

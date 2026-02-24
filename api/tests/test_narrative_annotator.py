@@ -371,3 +371,102 @@ def test_segments_to_tagged_text_plain_text_unchanged():
     tagged = segments_to_tagged_text(segments)
     assert tagged.strip() == text.strip()
     assert "[pause:" not in tagged
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Pipeline integration — annotated text ↔ smart_split compatibility
+# ---------------------------------------------------------------------------
+
+# This is the same regex smart_split uses to detect pause tags.
+# Copied from api/src/services/text_processing/text_processor.py
+# to verify format compatibility without importing Docker-only deps.
+import re as _re
+
+_PAUSE_TAG_PATTERN = _re.compile(r"\[pause:(\d+(?:\.\d+)?)s\]", _re.IGNORECASE)
+
+
+def test_annotated_text_produces_valid_pause_tags():
+    """Tagged text from annotator matches the PAUSE_TAG_PATTERN regex used by smart_split."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    text = "First paragraph.\n\nSecond paragraph.\n\n---\n\nThird paragraph."
+    segments = annotate(text)
+    tagged = segments_to_tagged_text(segments)
+
+    # Extract all pause tags
+    matches = _PAUSE_TAG_PATTERN.findall(tagged)
+    assert len(matches) >= 2, f"Expected at least 2 pause tags, got {len(matches)} in: {tagged}"
+
+    # All durations must be valid positive floats
+    for duration_str in matches:
+        duration = float(duration_str)
+        assert duration > 0, f"Pause duration should be positive, got {duration}"
+
+
+def test_annotated_text_splits_correctly_on_pause_tags():
+    """PAUSE_TAG_PATTERN.split() on annotated text produces alternating text/duration parts."""
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    text = "First paragraph.\n\nSecond paragraph.\n\n---\n\nThird paragraph."
+    segments = annotate(text)
+    tagged = segments_to_tagged_text(segments)
+
+    # This is exactly how smart_split processes text — split on pause tags
+    parts = _PAUSE_TAG_PATTERN.split(tagged)
+
+    # Parts alternate: text, duration_str, text, duration_str, ...
+    text_parts = [parts[i].strip() for i in range(0, len(parts), 2) if parts[i].strip()]
+    duration_parts = [parts[i] for i in range(1, len(parts), 2)]
+
+    assert len(text_parts) >= 3, f"Expected 3+ text parts, got {len(text_parts)}: {text_parts}"
+    assert len(duration_parts) >= 2, f"Expected 2+ pause durations, got {len(duration_parts)}"
+    assert "First paragraph." in text_parts[0]
+    assert "Third paragraph." in text_parts[-1]
+
+
+@pytest.mark.asyncio
+async def test_annotated_text_flows_through_smart_split():
+    """Tagged text from annotator is compatible with smart_split's pause handling.
+
+    This test requires Docker-only dependencies (loguru, phonemizer, etc.).
+    It is skipped when those dependencies are not available.
+    """
+    try:
+        # smart_split depends on loguru, phonemizer, etc. — Docker-only
+        tp_path = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "services"
+            / "text_processing"
+            / "text_processor.py"
+        )
+        tp_spec = importlib.util.spec_from_file_location(
+            "api.src.services.text_processing.text_processor", tp_path
+        )
+        tp_mod = importlib.util.module_from_spec(tp_spec)
+        sys.modules["api.src.services.text_processing.text_processor"] = tp_mod
+        tp_spec.loader.exec_module(tp_mod)
+        smart_split = tp_mod.smart_split
+    except (ImportError, ModuleNotFoundError) as exc:
+        pytest.skip(f"smart_split unavailable outside Docker: {exc}")
+
+    mod = _load_narrative_annotator()
+    annotate = mod.annotate
+    segments_to_tagged_text = mod.segments_to_tagged_text
+
+    text = "First paragraph.\n\nSecond paragraph.\n\n---\n\nThird paragraph."
+    segments = annotate(text)
+    tagged = segments_to_tagged_text(segments)
+
+    chunks = []
+    async for chunk_text, tokens, pause_duration in smart_split(tagged):
+        chunks.append((chunk_text, tokens, pause_duration))
+
+    text_chunks = [c for c in chunks if c[2] is None]
+    pause_chunks = [c for c in chunks if c[2] is not None]
+    assert len(text_chunks) >= 2
+    assert len(pause_chunks) >= 1
