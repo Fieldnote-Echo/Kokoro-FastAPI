@@ -22,7 +22,7 @@ dependencies = [
     # Utilities
     "aiofiles==23.2.1",
     "tqdm==4.67.1",
-    "requests==2.32.3",
+    "requests==2.33.0",
     "munch==4.0.0",
     "tiktoken==0.8.0",
     "loguru==0.7.3",
