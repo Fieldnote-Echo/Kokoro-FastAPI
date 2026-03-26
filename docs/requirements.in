@@ -8,7 +8,7 @@ python-dotenv==1.0.1
 sqlalchemy==2.0.27
 
 # ML/DL
-transformers==4.47.1
+transformers==4.53.0
 numpy>=1.26.0  # Version managed by PyTorch dependencies
 scipy==1.14.1
 onnxruntime==1.20.1
@@ -23,7 +23,7 @@ regex==2024.11.6
 # Utilities
 aiofiles==23.2.1  # Last version before Windows path handling changes
 tqdm==4.67.1
-requests==2.32.3
+requests==2.33.0
 munch==4.0.0
 tiktoken===0.8.0
 loguru==0.7.3
