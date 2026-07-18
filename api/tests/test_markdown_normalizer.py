@@ -218,3 +218,27 @@ def test_unclosed_fence_protects_content():
 def test_bare_unclosed_fence_line():
     """A lone opening fence with no content voices nothing."""
     assert handle_markdown("```python").strip() == ""
+
+
+# ── Parenthesized URLs in links and images ───────────────────────────────
+
+
+def test_link_with_parenthesized_url():
+    md = "[Foo](https://en.wikipedia.org/wiki/Foo_(bar))"
+    assert handle_markdown(md) == "Foo"
+
+
+def test_image_with_parenthesized_url():
+    md = "![alt text](https://example.com/img_(1).png)"
+    assert handle_markdown(md) == "alt text"
+
+
+def test_link_paren_url_with_surrounding_text():
+    md = "See [Foo](https://en.wikipedia.org/wiki/Foo_(bar)) today"
+    assert handle_markdown(md) == "See Foo today"
+
+
+def test_link_plain_url_still_stops_at_paren():
+    """A plain link followed by a parenthetical must not over-match."""
+    md = "[here](https://x.com) (see note)"
+    assert handle_markdown(md) == "here (see note)"

@@ -202,8 +202,11 @@ _MD_FENCED_CODE = re.compile(
     r"^[ \t]*```[^\n]*\n?(.*?)(?:```|\Z)", re.DOTALL | re.MULTILINE
 )
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+# URL part tolerates one level of balanced parens, e.g. wiki/Foo_(bar) —
+# enough for real-world URLs without over-matching past the closing ).
+_MD_URL_PART = r"(?:[^()]|\([^()]*\))+"
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\(" + _MD_URL_PART + r"\)")
 # Emphasis content: spans single newlines (soft wraps) but never a blank
 # line (paragraph break) — CommonMark-ish, avoids catastrophic over-matching.
 _MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n))+?"
