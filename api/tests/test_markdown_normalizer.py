@@ -285,3 +285,58 @@ async def test_custom_phoneme_spacing_preserved_between_tokens():
     combined = " ".join(chunks)
     assert "/) [rest]" in combined
     assert "/)[rest]" not in combined
+
+
+# ── Markdown normalization for non-English languages ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_markdown_stripped_for_non_english_language():
+    """Markdown syntax is language-independent — it must be stripped even
+    when the rest of (English-specific) normalization is skipped."""
+    chunks = []
+    async for chunk_text, _, _ in smart_split(
+        "# Heading\nDas ist **fett** und [Link](https://example.com).",
+        lang_code="e",
+        normalization_options=NormalizationOptions(),
+    ):
+        chunks.append(chunk_text)
+
+    combined = " ".join(chunks)
+    assert "**" not in combined
+    assert "#" not in combined
+    assert "](" not in combined
+    assert "fett" in combined
+    assert "Link" in combined
+
+
+@pytest.mark.asyncio
+async def test_non_english_markdown_keeps_custom_phonemes():
+    """Custom phoneme tokens look like markdown links — they must survive
+    the markdown pass for non-English languages too."""
+    chunks = []
+    async for chunk_text, _, _ in smart_split(
+        "Sag [Kokoro](/kˈOkəɹO/) **bitte**.",
+        lang_code="e",
+        normalization_options=NormalizationOptions(),
+    ):
+        chunks.append(chunk_text)
+
+    combined = " ".join(chunks)
+    assert "[Kokoro](/kˈOkəɹO/)" in combined
+    assert "**" not in combined
+
+
+@pytest.mark.asyncio
+async def test_non_english_markdown_respects_toggle():
+    """With markdown_normalization disabled, non-English text is untouched."""
+    chunks = []
+    async for chunk_text, _, _ in smart_split(
+        "Das ist **fett**.",
+        lang_code="e",
+        normalization_options=NormalizationOptions(markdown_normalization=False),
+    ):
+        chunks.append(chunk_text)
+
+    combined = " ".join(chunks)
+    assert "**fett**" in combined
