@@ -196,7 +196,11 @@ NUMBER_PATTERN = re.compile(
 # ---------------------------------------------------------------------------
 # Order matters: fenced code blocks first, then inline, then structural.
 # Bold before italic to avoid partial matches on **.
-_MD_FENCED_CODE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# A fence opens at line start; an unclosed fence (streaming/truncated
+# chunks) extends to end of input — strip the fence line, keep the content.
+_MD_FENCED_CODE = re.compile(
+    r"^[ \t]*```[^\n]*\n?(.*?)(?:```|\Z)", re.DOTALL | re.MULTILINE
+)
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
 _MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")

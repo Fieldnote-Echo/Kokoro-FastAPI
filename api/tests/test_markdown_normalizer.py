@@ -190,3 +190,31 @@ def test_emphasis_does_not_span_blank_lines():
 def test_emphasis_does_not_span_whitespace_only_blank_lines():
     md = "**alpha\n   \nbeta**"
     assert handle_markdown(md) == md
+
+
+# ── Unclosed fenced code blocks (streaming / truncated chunks) ───────────
+
+
+def test_unclosed_fenced_code_block():
+    """An unclosed fence extends to end of input: fence line stripped, content kept."""
+    result = handle_markdown("```python\nprint('hi')")
+    assert result == "print('hi')"
+
+
+def test_unclosed_fenced_code_block_with_prefix():
+    result = handle_markdown("Here is code:\n```python\nmodel.train()\n")
+    assert "`" not in result
+    assert "python" not in result
+    assert "model.train()" in result
+    assert "Here is code:" in result
+
+
+def test_unclosed_fence_protects_content():
+    """Markdown inside an unclosed fence must not be stripped."""
+    result = handle_markdown("```\n**not stripped**")
+    assert "**not stripped**" in result
+
+
+def test_bare_unclosed_fence_line():
+    """A lone opening fence with no content voices nothing."""
+    assert handle_markdown("```python").strip() == ""
