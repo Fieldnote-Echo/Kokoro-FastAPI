@@ -1,6 +1,10 @@
 """Unit tests for handle_markdown() — the navi-os fork of Kokoro's normalizer."""
 
+import pytest
+
 from api.src.services.text_processing.normalizer import handle_markdown
+from api.src.services.text_processing.text_processor import smart_split
+from api.src.structures.schemas import NormalizationOptions
 
 # ── Tests ────────────────────────────────────────────────────────────────
 
@@ -242,3 +246,42 @@ def test_link_plain_url_still_stops_at_paren():
     """A plain link followed by a parenthetical must not over-match."""
     md = "[here](https://x.com) (see note)"
     assert handle_markdown(md) == "here (see note)"
+
+
+# ── Custom phoneme spacing through smart_split ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_custom_phoneme_spacing_preserved():
+    """Words must not get glued to custom phoneme tokens during normalization.
+
+    smart_split splits on CUSTOM_PHONEMES and rejoins segments with ''.join;
+    if segment edges get stripped, 'Say [Kokoro](...) please' becomes
+    'Say[Kokoro](...)please'.
+    """
+    chunks = []
+    async for chunk_text, _, _ in smart_split(
+        "Say [Kokoro](/kˈOkəɹO/) please.",
+        normalization_options=NormalizationOptions(),
+    ):
+        chunks.append(chunk_text)
+
+    combined = " ".join(chunks)
+    assert "Say [Kokoro](/kˈOkəɹO/) please." in combined
+    assert "Say[" not in combined
+    assert ")please" not in combined
+
+
+@pytest.mark.asyncio
+async def test_custom_phoneme_spacing_preserved_between_tokens():
+    """A whitespace-only segment between two phoneme tokens must survive."""
+    chunks = []
+    async for chunk_text, _, _ in smart_split(
+        "[Kokoro](/kˈOkəɹO/) [rest](/ɹˈɛst/) now.",
+        normalization_options=NormalizationOptions(),
+    ):
+        chunks.append(chunk_text)
+
+    combined = " ".join(chunks)
+    assert "/) [rest]" in combined
+    assert "/)[rest]" not in combined
