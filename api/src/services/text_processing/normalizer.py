@@ -205,13 +205,19 @@ _MD_FENCED_CODE = re.compile(
 # Blockquote marker to dedent from fenced content when the fence itself was
 # blockquoted ('> ```' ... '> code' ... '> ```').
 _MD_BLOCKQUOTE_DEDENT = re.compile(r"^>[ \t]?", re.MULTILINE)
+# Placeholder restore patterns (Phase 3) — input NULs are stripped up front,
+# so these can only match placeholders this module minted.
+_MD_CB_PLACEHOLDER = re.compile("\x00CB(\\d+)\x00")
+_MD_IC_PLACEHOLDER = re.compile("\x00IC(\\d+)\x00")
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
 # URL part tolerates one level of balanced parens, e.g. wiki/Foo_(bar) —
 # enough for real-world URLs without over-matching past the closing ).
-_MD_URL_PART = r"(?:[^()]|\([^()]*\))+"
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
+# Link text and URL are length-bounded like emphasis: on '[' floods the
+# unbounded '[^\]]*' scanned to end-of-string from every position (O(n^2)).
+_MD_URL_PART = r"(?:[^()]|\([^()]*\)){1,2000}"
+_MD_IMAGE = re.compile(r"!\[([^\]]{0,800})\]\(" + _MD_URL_PART + r"\)")
 # Link text may be empty ('[](url)') — the whole link then drops entirely.
-_MD_LINK = re.compile(r"\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
+_MD_LINK = re.compile(r"\[([^\]]{0,800})\]\(" + _MD_URL_PART + r"\)")
 # Emphasis content: spans single newlines (soft wraps) but never a blank
 # line (paragraph break) — CommonMark-ish. Bounded at 600 chars so a flood
 # of unclosed markers scans O(n·600) instead of O(n^2); longer "spans" are
@@ -235,8 +241,15 @@ _MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
 _MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
 _MD_UNORDERED_LIST = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
 _MD_ORDERED_LIST = re.compile(r"^(\s*)\d+\.\s+", re.MULTILINE)
-# Table separator rows like |---|---|
-_MD_TABLE_SEP_ROW = re.compile(r"^\s*\|?[\s:]*-{3,}[\s:|-]*\|?\s*$", re.MULTILINE)
+# Table separator rows like |---|---|. Detected with a single ambiguity-free
+# character class plus a substring check: the old '-{3,}[\s:|-]*' form had two
+# adjacent quantifiers both matching '-', giving O(n^2) backtracking on long
+# dash lines.
+_MD_TABLE_SEP_CHARS = re.compile(r"[ \t:|-]*")
+
+
+def _is_table_sep_row(line: str) -> bool:
+    return "---" in line and _MD_TABLE_SEP_CHARS.fullmatch(line) is not None
 
 
 def handle_markdown(text: str) -> str:
@@ -309,7 +322,7 @@ def handle_markdown(text: str) -> str:
     # logic, then restore as bare pipes at the end.
     text = text.replace("\\|", "\x00EP\x00")
     lines = text.split("\n")
-    is_sep_row = [bool(_MD_TABLE_SEP_ROW.match(line)) for line in lines]
+    is_sep_row = [_is_table_sep_row(line) for line in lines]
     for i, line in enumerate(lines):
         if is_sep_row[i]:
             lines[i] = ""
@@ -326,10 +339,12 @@ def handle_markdown(text: str) -> str:
     text = "\n".join(lines).replace("\x00EP\x00", "|")
 
     # --- Phase 3: Restore protected code content ---
-    for idx, content in enumerate(code_blocks):
-        text = text.replace(f"\x00CB{idx}\x00", content)
-    for idx, content in enumerate(inline_codes):
-        text = text.replace(f"\x00IC{idx}\x00", content)
+    # Single-pass sub keyed on the placeholder index: a per-item str.replace
+    # loop is O(placeholders x len(text)) — quadratic on fence/backtick floods.
+    if code_blocks:
+        text = _MD_CB_PLACEHOLDER.sub(lambda m: code_blocks[int(m.group(1))], text)
+    if inline_codes:
+        text = _MD_IC_PLACEHOLDER.sub(lambda m: inline_codes[int(m.group(1))], text)
 
     return text
 

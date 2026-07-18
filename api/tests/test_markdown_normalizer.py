@@ -469,3 +469,40 @@ def test_escaped_pipes_not_table():
     """Escaped pipes are literal content, not table syntax."""
     result = handle_markdown("use a \\| b \\| c here")
     assert result == "use a | b | c here"
+
+
+def test_adversarial_floods_are_fast():
+    """Every markdown pass must stay near-linear on pathological input.
+
+    Covers the verifier-found quadratic vectors beyond emphasis: long
+    dash lines (table separator backtracking), '[' floods (link/image
+    scan-to-EOS), fence-opener and backtick-pair floods (per-placeholder
+    str.replace restore loop).
+    """
+    import time
+
+    payloads = [
+        "-" * 40_000 + ".",          # table separator backtracking
+        "[word " * (100_000 // 6),   # unclosed-bracket link flood
+        "```\n" * (100_000 // 4),    # fence-opener flood -> placeholder restore
+        "`a`" * (100_000 // 3),      # inline-code flood -> placeholder restore
+    ]
+    for payload in payloads:
+        start = time.monotonic()
+        handle_markdown(payload)
+        assert time.monotonic() - start < 2.0, f"slow on {payload[:20]!r}..."
+
+
+def test_emphasis_flood_scales_linearly():
+    """Scaling ratio guard: 4x input must cost ~4x time (linear), not
+    ~16x (quadratic). Ratio bound is generous for CI noise."""
+    import time
+
+    def cost(n: int) -> float:
+        payload = "__word " * (n // 7)
+        start = time.monotonic()
+        handle_markdown(payload)
+        return time.monotonic() - start
+
+    small, large = cost(100_000), cost(400_000)
+    assert large / max(small, 1e-3) < 9.0
