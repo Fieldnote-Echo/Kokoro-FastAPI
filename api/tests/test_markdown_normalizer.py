@@ -506,3 +506,31 @@ def test_emphasis_flood_scales_linearly():
 
     small, large = cost(100_000), cost(400_000)
     assert large / max(small, 1e-3) < 9.0
+
+
+def test_newline_and_whitespace_floods_are_fast():
+    """List-marker patterns must not scan quadratically on blank-line
+    floods ('^(\\s*)' + MULTILINE consumed all following newlines from
+    every line anchor; 100KB of newlines took 65s)."""
+    import time
+
+    for payload in ["\n" * 100_000, "\r\n" * 50_000, " \n" * 50_000]:
+        start = time.monotonic()
+        handle_markdown(payload)
+        assert time.monotonic() - start < 2.0
+
+
+def test_long_wordrun_through_normalize_text_is_fast():
+    """URL_PATTERN must not scan quadratically on long word-char runs
+    with no dot-TLD (100KB single line previously hung normalize_text)."""
+    import time
+
+    from api.src.services.text_processing.normalizer import (
+        normalize_text,
+    )
+    from api.src.structures.schemas import NormalizationOptions
+
+    for payload in ["a" * 100_000, "a." * 50_000, "a@" * 50_000]:
+        start = time.monotonic()
+        normalize_text(payload, NormalizationOptions())
+        assert time.monotonic() - start < 2.0

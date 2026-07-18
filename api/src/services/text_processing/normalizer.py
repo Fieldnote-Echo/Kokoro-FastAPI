@@ -158,11 +158,19 @@ SYMBOL_REPLACEMENTS = {
 MONEY_UNITS = {"$": ("dollar", "cent"), "£": ("pound", "pence"), "€": ("euro", "cent")}
 
 # Pre-compiled regex patterns for performance
+# Local part and domain are bounded at their RFC limits (64 / 253 chars):
+# unbounded runs made every word boundary in 'a.a.a...' floods scan the
+# whole remaining string for '@' — O(n^2).
 EMAIL_PATTERN = re.compile(
-    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}\b", re.IGNORECASE
+    r"\b[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9.-]{1,253}\.[a-z]{2,}\b", re.IGNORECASE
 )
 URL_PATTERN = re.compile(
-    r"(https?://|www\.|)+(localhost|[a-zA-Z0-9.-]+(\.(?:"
+    # Negative lookbehind: only attempt a match at token starts. Without it
+    # the domain branch re-scans from every position inside a long word-char
+    # run (O(n^2) — a 100KB run of 'a' hung the normalizer). The domain run
+    # is also bounded at 253 chars, the DNS name length limit.
+    r"(?<![a-zA-Z0-9.-])"
+    r"(https?://|www\.|)+(localhost|[a-zA-Z0-9.-]{1,253}(\.(?:"
     + "|".join(VALID_TLDS)
     + r"))+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:[0-9]+)?([/?][^\s]*)?",
     re.IGNORECASE,
@@ -239,8 +247,11 @@ _MD_HEADING = re.compile(
 )
 _MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
 _MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
-_MD_UNORDERED_LIST = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
-_MD_ORDERED_LIST = re.compile(r"^(\s*)\d+\.\s+", re.MULTILINE)
+# List indentation/spacing is spaces and tabs only — '\s' would let the
+# MULTILINE '^' anchor swallow every following blank line from each line
+# start, which is O(n^2) on newline floods.
+_MD_UNORDERED_LIST = re.compile(r"^([ \t]*)[-*+][ \t]+", re.MULTILINE)
+_MD_ORDERED_LIST = re.compile(r"^([ \t]*)\d+\.[ \t]+", re.MULTILINE)
 # Table separator rows like |---|---|. Detected with a single ambiguity-free
 # character class plus a substring check: the old '-{3,}[\s:|-]*' form had two
 # adjacent quantifiers both matching '-', giving O(n^2) backtracking on long
@@ -663,8 +674,10 @@ def normalize_text(text: str, normalization_options: NormalizationOptions) -> st
     text = re.sub(r"(?<=\d)S", " S", text)
     text = re.sub(r"(?<=[BCDFGHJ-NP-TV-Z])'?s\b", "'S", text)
     text = re.sub(r"(?<=X')S\b", "s", text)
+    # Bound the acronym run (real dotted acronyms are short): an unbounded
+    # '{2,}' backtracks O(n) from every position of an 'a.a.a...' flood — O(n^2).
     text = re.sub(
-        r"(?:[A-Za-z]\.){2,} [a-z]", lambda m: m.group().replace(".", "-"), text
+        r"(?:[A-Za-z]\.){2,12} [a-z]", lambda m: m.group().replace(".", "-"), text
     )
     text = re.sub(r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
 
