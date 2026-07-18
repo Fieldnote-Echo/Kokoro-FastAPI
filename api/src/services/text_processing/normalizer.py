@@ -196,11 +196,15 @@ NUMBER_PATTERN = re.compile(
 # ---------------------------------------------------------------------------
 # Order matters: fenced code blocks first, then inline, then structural.
 # Bold before italic to avoid partial matches on **.
-# A fence opens at line start; an unclosed fence (streaming/truncated
-# chunks) extends to end of input — strip the fence line, keep the content.
+# A fence opens at line start (optionally inside a blockquote); an unclosed
+# fence (streaming/truncated chunks) extends to end of input — strip the
+# fence line, keep the content.
 _MD_FENCED_CODE = re.compile(
-    r"^[ \t]*```[^\n]*\n?(.*?)(?:```|\Z)", re.DOTALL | re.MULTILINE
+    r"^[ \t]*(>[ \t]*)?```[^\n]*\n?(.*?)(?:```|\Z)", re.DOTALL | re.MULTILINE
 )
+# Blockquote marker to dedent from fenced content when the fence itself was
+# blockquoted ('> ```' ... '> code' ... '> ```').
+_MD_BLOCKQUOTE_DEDENT = re.compile(r"^>[ \t]?", re.MULTILINE)
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
 # URL part tolerates one level of balanced parens, e.g. wiki/Foo_(bar) —
 # enough for real-world URLs without over-matching past the closing ).
@@ -209,8 +213,10 @@ _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
 # Link text may be empty ('[](url)') — the whole link then drops entirely.
 _MD_LINK = re.compile(r"\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
 # Emphasis content: spans single newlines (soft wraps) but never a blank
-# line (paragraph break) — CommonMark-ish, avoids catastrophic over-matching.
-_MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n))+?"
+# line (paragraph break) — CommonMark-ish. Bounded at 600 chars so a flood
+# of unclosed markers scans O(n·600) instead of O(n^2); longer "spans" are
+# not real emphasis and simply stay unstripped.
+_MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n)){1,600}?"
 _MD_BOLD = re.compile(r"\*\*(" + _MD_EMPHASIS_CONTENT + r")\*\*")
 # Bold with __ — word-boundary-aware like the underscore italic below.
 _MD_BOLD_UNDER = re.compile(r"(?<!\w)__(" + _MD_EMPHASIS_CONTENT + r")__(?!\w)")
@@ -245,13 +251,21 @@ def handle_markdown(text: str) -> str:
     # \x00-delimited placeholders below collision-proof against input that
     # happens to contain literal placeholder-looking text.
     text = text.replace("\x00", "")
+    # Normalize line endings: every MULTILINE anchor and blank-line lookahead
+    # below assumes \n; raw \r defeats them (CRLF headings leak '##', CRLF
+    # blank lines stop acting as paragraph breaks for emphasis).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     # Extract fenced code blocks and inline code into placeholders so that
     # markdown syntax inside code (e.g. **bold**) is preserved literally.
     code_blocks: list[str] = []
 
     def _save_fenced(m: re.Match) -> str:
-        code_blocks.append(m.group(1))
+        content = m.group(2)
+        if m.group(1):
+            # Fence was blockquoted — dedent the '> ' markers from content.
+            content = _MD_BLOCKQUOTE_DEDENT.sub("", content)
+        code_blocks.append(content)
         return f"\x00CB{len(code_blocks) - 1}\x00"
 
     text = _MD_FENCED_CODE.sub(_save_fenced, text)
@@ -291,6 +305,9 @@ def handle_markdown(text: str) -> str:
     # rows. A row must have 2+ pipes AND either be pipe-anchored (leading or
     # trailing |) or sit next to a separator row; prose pipes like
     # "either a | b | c works" stay intact.
+    # Escaped pipes (\|) are literal content — hide them from the table
+    # logic, then restore as bare pipes at the end.
+    text = text.replace("\\|", "\x00EP\x00")
     lines = text.split("\n")
     is_sep_row = [bool(_MD_TABLE_SEP_ROW.match(line)) for line in lines]
     for i, line in enumerate(lines):
@@ -306,7 +323,7 @@ def handle_markdown(text: str) -> str:
         )
         if pipe_anchored or near_sep_row:
             lines[i] = line.replace("|", " ")
-    text = "\n".join(lines)
+    text = "\n".join(lines).replace("\x00EP\x00", "|")
 
     # --- Phase 3: Restore protected code content ---
     for idx, content in enumerate(code_blocks):

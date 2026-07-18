@@ -403,3 +403,69 @@ def test_headerless_table_rows_near_separator():
     assert "---" not in result
     assert "Alice" in result
     assert "NYC" in result
+
+
+# ---------------------------------------------------------------------------
+# CRLF handling (verifier findings: MULTILINE anchors assume \n)
+# ---------------------------------------------------------------------------
+
+
+def test_crlf_closed_atx_heading():
+    """Closing-hash headings must strip on CRLF input, not leak '##'."""
+    result = handle_markdown("## Heading ##\r\nbody")
+    assert "#" not in result
+    assert "Heading" in result
+    assert "body" in result
+
+
+def test_crlf_blank_line_stops_emphasis():
+    """A CRLF blank line is a paragraph break — emphasis must not span it."""
+    result = handle_markdown("*start\r\n\r\nend*")
+    assert "*start" in result
+    assert "end*" in result
+
+
+def test_crlf_equivalent_to_lf():
+    """CRLF input must normalize to the same speech text as LF input."""
+    lf = handle_markdown("# Title\n\n**bold** and _em_\n\n- item")
+    crlf = handle_markdown("# Title\r\n\r\n**bold** and _em_\r\n\r\n- item")
+    assert crlf == lf
+
+
+# ---------------------------------------------------------------------------
+# Pathological-input performance (verifier finding: quadratic emphasis scan)
+# ---------------------------------------------------------------------------
+
+
+def test_unclosed_emphasis_flood_is_fast():
+    """Repeated unclosed emphasis markers must not scan quadratically.
+
+    100KB of '*word ' previously took >10s (O(n^2)); bounded emphasis
+    spans make it linear. Generous ceiling to avoid CI flakiness.
+    """
+    import time
+
+    for marker in ("*word ", "_word ", "__word "):
+        payload = marker * (100_000 // len(marker))
+        start = time.monotonic()
+        handle_markdown(payload)
+        assert time.monotonic() - start < 2.0
+
+
+# ---------------------------------------------------------------------------
+# Blockquoted fences and escaped pipes (verifier minors)
+# ---------------------------------------------------------------------------
+
+
+def test_fenced_code_inside_blockquote():
+    """A fence opened inside a blockquote must not be garbled by the
+    inline-code pass pairing backticks across lines."""
+    result = handle_markdown("> ```\n> code line\n> ```")
+    assert "`" not in result
+    assert "code line" in result
+
+
+def test_escaped_pipes_not_table():
+    """Escaped pipes are literal content, not table syntax."""
+    result = handle_markdown("use a \\| b \\| c here")
+    assert result == "use a | b | c here"
