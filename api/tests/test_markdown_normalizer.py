@@ -159,3 +159,34 @@ def test_bold_with_surrounding_text():
 def test_link_with_surrounding_text():
     result = handle_markdown("Click [here](https://x.com) now")
     assert result == "Click here now"
+
+
+# ── Multiline emphasis (soft wraps) ──────────────────────────────────────
+
+
+def test_bold_across_soft_wrap():
+    """Emphasis should span a single newline (soft-wrapped paragraph)."""
+    assert handle_markdown("**bold\ntext**") == "bold\ntext"
+
+
+def test_italic_star_across_soft_wrap():
+    assert handle_markdown("*ital\nic*") == "ital\nic"
+
+
+def test_italic_underscore_across_soft_wrap():
+    assert handle_markdown("_ital\nic_") == "ital\nic"
+
+
+def test_strikethrough_across_soft_wrap():
+    assert handle_markdown("~~gone\nnow~~") == "gone\nnow"
+
+
+def test_emphasis_does_not_span_blank_lines():
+    """A blank line is a paragraph break — emphasis must not match across it."""
+    md = "**alpha\n\nbeta**"
+    assert handle_markdown(md) == md
+
+
+def test_emphasis_does_not_span_whitespace_only_blank_lines():
+    md = "**alpha\n   \nbeta**"
+    assert handle_markdown(md) == md

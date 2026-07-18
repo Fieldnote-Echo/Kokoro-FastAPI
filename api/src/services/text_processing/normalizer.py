@@ -200,13 +200,16 @@ _MD_FENCED_CODE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
 _MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
-_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+# Emphasis content: spans single newlines (soft wraps) but never a blank
+# line (paragraph break) — CommonMark-ish, avoids catastrophic over-matching.
+_MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n))+?"
+_MD_BOLD = re.compile(r"\*\*(" + _MD_EMPHASIS_CONTENT + r")\*\*")
 # Italic with * — only match when not preceded/followed by word chars to avoid
 # false positives inside URLs or filenames.
-_MD_ITALIC_STAR = re.compile(r"(?<!\w)\*(.+?)\*(?!\w)")
+_MD_ITALIC_STAR = re.compile(r"(?<!\w)\*(" + _MD_EMPHASIS_CONTENT + r")\*(?!\w)")
 # Italic with _ — word-boundary-aware so snake_case stays intact.
-_MD_ITALIC_UNDER = re.compile(r"(?<!\w)_(.+?)_(?!\w)")
-_MD_STRIKETHROUGH = re.compile(r"~~(.+?)~~")
+_MD_ITALIC_UNDER = re.compile(r"(?<!\w)_(" + _MD_EMPHASIS_CONTENT + r")_(?!\w)")
+_MD_STRIKETHROUGH = re.compile(r"~~(" + _MD_EMPHASIS_CONTENT + r")~~")
 _MD_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
 _MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
