@@ -340,3 +340,66 @@ async def test_non_english_markdown_respects_toggle():
 
     combined = " ".join(chunks)
     assert "**fett**" in combined
+
+
+# ── Minor batch: emphasis, headings, links, sentinels, tables ────────────
+
+
+def test_bold_double_underscore():
+    assert handle_markdown("__bold__") == "bold"
+
+
+def test_bold_double_underscore_with_surrounding_text():
+    assert handle_markdown("This is __bold__ text") == "This is bold text"
+
+
+def test_closed_atx_heading():
+    """ATX headings may close with trailing hashes: '## H ##' -> 'H'."""
+    assert handle_markdown("## Heading ##") == "Heading"
+
+
+def test_heading_with_trailing_hash_word_kept():
+    """A '#' glued to a word is content, not a closing sequence."""
+    assert handle_markdown("# Learning C#") == "Learning C#"
+
+
+def test_heading_after_list_marker():
+    """List markers are stripped before headings so '- # H' voices 'H'."""
+    assert handle_markdown("- # Heading") == "Heading"
+
+
+def test_heading_after_ordered_list_marker():
+    assert handle_markdown("1. ## Heading") == "Heading"
+
+
+def test_empty_link_text_dropped():
+    result = handle_markdown("before [](https://example.com) after")
+    assert "[" not in result
+    assert "]" not in result
+    assert "example.com" not in result
+    assert "before" in result
+    assert "after" in result
+
+
+def test_sentinel_collision_safe():
+    """Literal placeholder-looking input must not corrupt code restoration."""
+    md = "weird \x00CB0\x00 input\n```\nsecret code\n```"
+    result = handle_markdown(md)
+    assert result.count("secret code") == 1
+
+
+def test_prose_with_pipes_not_table():
+    """2+ pipes in prose without table shape must be preserved."""
+    text = "either a | b | c works"
+    assert handle_markdown(text) == text
+
+
+def test_headerless_table_rows_near_separator():
+    """Rows without leading/trailing pipes count as table when adjacent to a
+    separator row."""
+    md = "Name | Age | City\n--- | --- | ---\nAlice | 30 | NYC"
+    result = handle_markdown(md)
+    assert "|" not in result
+    assert "---" not in result
+    assert "Alice" in result
+    assert "NYC" in result

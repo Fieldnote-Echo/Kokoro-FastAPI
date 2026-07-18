@@ -206,18 +206,25 @@ _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
 # enough for real-world URLs without over-matching past the closing ).
 _MD_URL_PART = r"(?:[^()]|\([^()]*\))+"
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\(" + _MD_URL_PART + r"\)")
+# Link text may be empty ('[](url)') — the whole link then drops entirely.
+_MD_LINK = re.compile(r"\[([^\]]*)\]\(" + _MD_URL_PART + r"\)")
 # Emphasis content: spans single newlines (soft wraps) but never a blank
 # line (paragraph break) — CommonMark-ish, avoids catastrophic over-matching.
 _MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n))+?"
 _MD_BOLD = re.compile(r"\*\*(" + _MD_EMPHASIS_CONTENT + r")\*\*")
+# Bold with __ — word-boundary-aware like the underscore italic below.
+_MD_BOLD_UNDER = re.compile(r"(?<!\w)__(" + _MD_EMPHASIS_CONTENT + r")__(?!\w)")
 # Italic with * — only match when not preceded/followed by word chars to avoid
 # false positives inside URLs or filenames.
 _MD_ITALIC_STAR = re.compile(r"(?<!\w)\*(" + _MD_EMPHASIS_CONTENT + r")\*(?!\w)")
 # Italic with _ — word-boundary-aware so snake_case stays intact.
 _MD_ITALIC_UNDER = re.compile(r"(?<!\w)_(" + _MD_EMPHASIS_CONTENT + r")_(?!\w)")
 _MD_STRIKETHROUGH = re.compile(r"~~(" + _MD_EMPHASIS_CONTENT + r")~~")
-_MD_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+# ATX headings, tolerating indentation and an optional closing hash
+# sequence ('## H ##' -> 'H') — but '#' glued to a word stays ('C#').
+_MD_HEADING = re.compile(
+    r"^[ \t]*#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$", re.MULTILINE
+)
 _MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
 _MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
 _MD_UNORDERED_LIST = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
@@ -234,6 +241,11 @@ def handle_markdown(text: str) -> str:
     before the URL handler sees bare URLs.
     """
     # --- Phase 1: Protect code content from markdown stripping ---
+    # Drop any NUL bytes first: they can't be voiced anyway, and it makes the
+    # \x00-delimited placeholders below collision-proof against input that
+    # happens to contain literal placeholder-looking text.
+    text = text.replace("\x00", "")
+
     # Extract fenced code blocks and inline code into placeholders so that
     # markdown syntax inside code (e.g. **bold**) is preserved literally.
     code_blocks: list[str] = []
@@ -257,29 +269,42 @@ def handle_markdown(text: str) -> str:
     text = _MD_IMAGE.sub(r"\1", text)
     # Links — keep link text
     text = _MD_LINK.sub(r"\1", text)
-    # Bold (** before * to avoid partial match)
+    # Bold (** and __ before single-char markers to avoid partial match)
     text = _MD_BOLD.sub(r"\1", text)
+    text = _MD_BOLD_UNDER.sub(r"\1", text)
     # Italic (* and _)
     text = _MD_ITALIC_STAR.sub(r"\1", text)
     text = _MD_ITALIC_UNDER.sub(r"\1", text)
     # Strikethrough
     text = _MD_STRIKETHROUGH.sub(r"\1", text)
-    # Headings — strip leading hashes
-    text = _MD_HEADING.sub("", text)
+    # List markers — strip marker, keep text. Must run before headings so
+    # '- # Heading' loses both the marker and the hashes.
+    text = _MD_UNORDERED_LIST.sub(r"\1", text)
+    text = _MD_ORDERED_LIST.sub(r"\1", text)
+    # Headings — strip leading hashes (and any closing hash sequence)
+    text = _MD_HEADING.sub(r"\1", text)
     # Blockquotes — strip leading >
     text = _MD_BLOCKQUOTE.sub("", text)
     # Horizontal rules — remove entire line
     text = _MD_HORIZONTAL_RULE.sub("", text)
-    # List markers — strip marker, keep text
-    text = _MD_UNORDERED_LIST.sub(r"\1", text)
-    text = _MD_ORDERED_LIST.sub(r"\1", text)
-    # Table separator rows — remove entirely
-    text = _MD_TABLE_SEP_ROW.sub("", text)
-    # Table pipes — only replace on lines that look like table rows (2+ pipes).
-    # This preserves non-table pipes like "true | false".
+    # Tables — remove separator rows, replace pipes with spaces on table
+    # rows. A row must have 2+ pipes AND either be pipe-anchored (leading or
+    # trailing |) or sit next to a separator row; prose pipes like
+    # "either a | b | c works" stay intact.
     lines = text.split("\n")
+    is_sep_row = [bool(_MD_TABLE_SEP_ROW.match(line)) for line in lines]
     for i, line in enumerate(lines):
-        if line.count("|") >= 2:
+        if is_sep_row[i]:
+            lines[i] = ""
+            continue
+        if line.count("|") < 2:
+            continue
+        stripped = line.strip()
+        pipe_anchored = stripped.startswith("|") or stripped.endswith("|")
+        near_sep_row = (i > 0 and is_sep_row[i - 1]) or (
+            i + 1 < len(lines) and is_sep_row[i + 1]
+        )
+        if pipe_anchored or near_sep_row:
             lines[i] = line.replace("|", " ")
     text = "\n".join(lines)
 
