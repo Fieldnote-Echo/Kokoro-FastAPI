@@ -1,7 +1,10 @@
 """
-Text normalization module for TTS processing.
+Text normalization module for TTS processing — forked from remsky/Kokoro-FastAPI.
 Handles various text formats including URLs, emails, numbers, money, and special characters.
 Converts them into a format suitable for text-to-speech processing.
+
+Upstream: https://github.com/remsky/Kokoro-FastAPI/blob/master/api/src/services/text_processing/normalizer.py
+Delta: handle_markdown() function + markdown_normalization toggle in normalize_text()
 """
 
 import math
@@ -155,11 +158,22 @@ SYMBOL_REPLACEMENTS = {
 MONEY_UNITS = {"$": ("dollar", "cent"), "£": ("pound", "pence"), "€": ("euro", "cent")}
 
 # Pre-compiled regex patterns for performance
+# Local part and domain are bounded at their RFC limits (64 / 253 chars):
+# unbounded runs made every word boundary in 'a.a.a...' floods scan the
+# whole remaining string for '@' — O(n^2).
 EMAIL_PATTERN = re.compile(
-    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}\b", re.IGNORECASE
+    r"\b[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9.-]{1,253}\.[a-z]{2,}\b", re.IGNORECASE
 )
 URL_PATTERN = re.compile(
-    r"(https?://|www\.|)+(localhost|[a-zA-Z0-9.-]+(\.(?:"
+    # Negative lookbehind: only attempt a match at token starts. Without it
+    # the domain branch re-scans from every position inside a long word-char
+    # run (O(n^2) — a 100KB run of 'a' hung the normalizer). The domain run
+    # is also bounded at 253 chars, the DNS name length limit.
+    r"(?<![a-zA-Z0-9.-])"
+    # Optional scheme/host prefix. Written as two optionals rather than
+    # (https?://|www\.|)+ — a '+' over a group with an empty alternative is a
+    # ReDoS smell and needlessly non-deterministic.
+    r"(?:https?://)?(?:www\.)?(localhost|[a-zA-Z0-9.-]{1,253}(\.(?:"
     + "|".join(VALID_TLDS)
     + r"))+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:[0-9]+)?([/?][^\s]*)?",
     re.IGNORECASE,
@@ -187,6 +201,177 @@ NUMBER_PATTERN = re.compile(
     r"(-?)(\d+(?:\.\d+)?)((?: hundred| thousand| (?:[bm]|tr|quadr)illion|k|m|b)*)\b",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Markdown normalization patterns (added by navi-os fork)
+# ---------------------------------------------------------------------------
+# Order matters: fenced code blocks first, then inline, then structural.
+# Bold before italic to avoid partial matches on **.
+# A fence opens at line start (optionally inside a blockquote); an unclosed
+# fence (streaming/truncated chunks) extends to end of input — strip the
+# fence line, keep the content.
+_MD_FENCED_CODE = re.compile(
+    r"^[ \t]*(>[ \t]*)?```[^\n]*\n?(.*?)(?:```|\Z)", re.DOTALL | re.MULTILINE
+)
+# Blockquote marker to dedent from fenced content when the fence itself was
+# blockquoted ('> ```' ... '> code' ... '> ```').
+_MD_BLOCKQUOTE_DEDENT = re.compile(r"^>[ \t]?", re.MULTILINE)
+# Placeholder restore patterns (Phase 3) — input NULs are stripped up front,
+# so these can only match placeholders this module minted.
+_MD_CB_PLACEHOLDER = re.compile("\x00CB(\\d+)\x00")
+_MD_IC_PLACEHOLDER = re.compile("\x00IC(\\d+)\x00")
+_MD_INLINE_CODE = re.compile(r"`([^`]+)`")
+# URL part tolerates one level of balanced parens, e.g. wiki/Foo_(bar) —
+# enough for real-world URLs without over-matching past the closing ).
+# Link text and URL are length-bounded like emphasis: on '[' floods the
+# unbounded '[^\]]*' scanned to end-of-string from every position (O(n^2)).
+_MD_URL_PART = r"(?:[^()]|\([^()]*\)){1,2000}"
+_MD_IMAGE = re.compile(r"!\[([^\]]{0,800})\]\(" + _MD_URL_PART + r"\)")
+# Link text may be empty ('[](url)') — the whole link then drops entirely.
+_MD_LINK = re.compile(r"\[([^\]]{0,800})\]\(" + _MD_URL_PART + r"\)")
+# Emphasis content: spans single newlines (soft wraps) but never a blank
+# line (paragraph break) — CommonMark-ish. Bounded at 600 chars so a flood
+# of unclosed markers scans O(n·600) instead of O(n^2); longer "spans" are
+# not real emphasis and simply stay unstripped.
+_MD_EMPHASIS_CONTENT = r"(?:[^\n]|\n(?![ \t]*\n)){1,600}?"
+_MD_BOLD = re.compile(r"\*\*(" + _MD_EMPHASIS_CONTENT + r")\*\*")
+# Bold with __ — word-boundary-aware like the underscore italic below.
+_MD_BOLD_UNDER = re.compile(r"(?<!\w)__(" + _MD_EMPHASIS_CONTENT + r")__(?!\w)")
+# Italic with * — only match when not preceded/followed by word chars to avoid
+# false positives inside URLs or filenames.
+_MD_ITALIC_STAR = re.compile(r"(?<!\w)\*(" + _MD_EMPHASIS_CONTENT + r")\*(?!\w)")
+# Italic with _ — word-boundary-aware so snake_case stays intact.
+_MD_ITALIC_UNDER = re.compile(r"(?<!\w)_(" + _MD_EMPHASIS_CONTENT + r")_(?!\w)")
+_MD_STRIKETHROUGH = re.compile(r"~~(" + _MD_EMPHASIS_CONTENT + r")~~")
+# ATX headings, tolerating indentation and an optional closing hash
+# sequence ('## H ##' -> 'H') — but '#' glued to a word stays ('C#').
+_MD_HEADING = re.compile(
+    r"^[ \t]*#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$", re.MULTILINE
+)
+_MD_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
+_MD_HORIZONTAL_RULE = re.compile(r"^(?:---+|\*\*\*+|___+)\s*$", re.MULTILINE)
+# List indentation/spacing is spaces and tabs only — '\s' would let the
+# MULTILINE '^' anchor swallow every following blank line from each line
+# start, which is O(n^2) on newline floods.
+_MD_UNORDERED_LIST = re.compile(r"^([ \t]*)[-*+][ \t]+", re.MULTILINE)
+_MD_ORDERED_LIST = re.compile(r"^([ \t]*)\d+\.[ \t]+", re.MULTILINE)
+# Table separator rows like |---|---|. Detected with a single ambiguity-free
+# character class plus a substring check: the old '-{3,}[\s:|-]*' form had two
+# adjacent quantifiers both matching '-', giving O(n^2) backtracking on long
+# dash lines.
+_MD_TABLE_SEP_CHARS = re.compile(r"[ \t:|-]*")
+
+
+def _is_table_sep_row(line: str) -> bool:
+    return "---" in line and _MD_TABLE_SEP_CHARS.fullmatch(line) is not None
+
+
+def handle_markdown(text: str) -> str:
+    """Strip markdown formatting so TTS reads content, not syntax.
+
+    Designed as a pre-processing pass: runs BEFORE email/URL normalization
+    so that markdown link syntax ``[text](url)`` is reduced to ``text``
+    before the URL handler sees bare URLs.
+    """
+    # --- Phase 1: Protect code content from markdown stripping ---
+    # Drop any NUL bytes first: they can't be voiced anyway, and it makes the
+    # \x00-delimited placeholders below collision-proof against input that
+    # happens to contain literal placeholder-looking text.
+    text = text.replace("\x00", "")
+    # Normalize line endings: every MULTILINE anchor and blank-line lookahead
+    # below assumes \n; raw \r defeats them (CRLF headings leak '##', CRLF
+    # blank lines stop acting as paragraph breaks for emphasis).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Extract fenced code blocks and inline code into placeholders so that
+    # markdown syntax inside code (e.g. **bold**) is preserved literally.
+    code_blocks: list[str] = []
+
+    def _save_fenced(m: re.Match) -> str:
+        content = m.group(2)
+        if m.group(1):
+            # Fence was blockquoted — dedent the '> ' markers from content.
+            content = _MD_BLOCKQUOTE_DEDENT.sub("", content)
+        code_blocks.append(content)
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = _MD_FENCED_CODE.sub(_save_fenced, text)
+
+    inline_codes: list[str] = []
+
+    def _save_inline(m: re.Match) -> str:
+        inline_codes.append(m.group(1))
+        return f"\x00IC{len(inline_codes) - 1}\x00"
+
+    text = _MD_INLINE_CODE.sub(_save_inline, text)
+
+    # --- Phase 2: Strip markdown formatting ---
+    # Images — keep alt text
+    text = _MD_IMAGE.sub(r"\1", text)
+    # Links — keep link text
+    text = _MD_LINK.sub(r"\1", text)
+    # Bold (** and __ before single-char markers to avoid partial match)
+    text = _MD_BOLD.sub(r"\1", text)
+    text = _MD_BOLD_UNDER.sub(r"\1", text)
+    # Italic (* and _)
+    text = _MD_ITALIC_STAR.sub(r"\1", text)
+    text = _MD_ITALIC_UNDER.sub(r"\1", text)
+    # Strikethrough
+    text = _MD_STRIKETHROUGH.sub(r"\1", text)
+    # List markers — strip marker, keep text. Must run before headings so
+    # '- # Heading' loses both the marker and the hashes.
+    text = _MD_UNORDERED_LIST.sub(r"\1", text)
+    text = _MD_ORDERED_LIST.sub(r"\1", text)
+    # Headings — strip leading hashes (and any closing hash sequence)
+    text = _MD_HEADING.sub(r"\1", text)
+    # Blockquotes — strip leading >
+    text = _MD_BLOCKQUOTE.sub("", text)
+    # Horizontal rules — remove entire line
+    text = _MD_HORIZONTAL_RULE.sub("", text)
+    # Tables — remove separator rows and de-pipe the table body. A real table
+    # is a separator row (|---|---|) plus the contiguous pipe-bearing lines
+    # above and below it; propagate table status outward from each separator
+    # row. This catches borderless multi-row and 2-column tables (which the old
+    # "2+ pipes AND anchored/adjacent" heuristic missed) while leaving a lone
+    # prose line with pipes — "either a | b | c works", no adjacent separator —
+    # untouched. Escaped pipes (\|) are hidden as a sentinel first so they are
+    # neither counted as table syntax nor de-piped, then restored at the end.
+    text = text.replace("\\|", "\x00EP\x00")
+    lines = text.split("\n")
+    is_sep_row = [_is_table_sep_row(line) for line in lines]
+    is_table_row = [False] * len(lines)
+    for i, sep in enumerate(is_sep_row):
+        if not sep:
+            continue
+        j = i - 1
+        while j >= 0 and "|" in lines[j]:
+            is_table_row[j] = True
+            j -= 1
+        j = i + 1
+        while j < len(lines) and "|" in lines[j]:
+            is_table_row[j] = True
+            j += 1
+    for i, line in enumerate(lines):
+        if is_sep_row[i]:
+            lines[i] = ""
+        elif is_table_row[i]:
+            lines[i] = line.replace("|", " ")
+    text = "\n".join(lines).replace("\x00EP\x00", "|")
+
+    # --- Phase 3: Restore protected code content ---
+    # Single-pass sub keyed on the placeholder index: a per-item str.replace
+    # loop is O(placeholders x len(text)) — quadratic on fence/backtick floods.
+    if code_blocks:
+        text = _MD_CB_PLACEHOLDER.sub(lambda m: code_blocks[int(m.group(1))], text)
+    if inline_codes:
+        text = _MD_IC_PLACEHOLDER.sub(lambda m: inline_codes[int(m.group(1))], text)
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Upstream handlers (unchanged from v0.2.4)
+# ---------------------------------------------------------------------------
 
 INFLECT_ENGINE = inflect.engine()
 
@@ -410,6 +595,13 @@ def handle_time(t: re.Match[str]) -> str:
 def normalize_text(text: str, normalization_options: NormalizationOptions) -> str:
     """Normalize text for TTS processing"""
 
+    # Handle markdown formatting FIRST — strips syntax like **bold**, [link](url),
+    # ```code```, etc. before other handlers see the raw symbols.
+    # Must run before email/URL normalization: markdown links contain URLs that
+    # should be reduced to link text, not spelled out.
+    if normalization_options.markdown_normalization:
+        text = handle_markdown(text)
+
     # Handle email addresses first if enabled
     if normalization_options.email_normalization:
         text = EMAIL_PATTERN.sub(handle_email, text)
@@ -491,8 +683,10 @@ def normalize_text(text: str, normalization_options: NormalizationOptions) -> st
     text = re.sub(r"(?<=\d)S", " S", text)
     text = re.sub(r"(?<=[BCDFGHJ-NP-TV-Z])'?s\b", "'S", text)
     text = re.sub(r"(?<=X')S\b", "s", text)
+    # Bound the acronym run (real dotted acronyms are short): an unbounded
+    # '{2,}' backtracks O(n) from every position of an 'a.a.a...' flood — O(n^2).
     text = re.sub(
-        r"(?:[A-Za-z]\.){2,} [a-z]", lambda m: m.group().replace(".", "-"), text
+        r"(?:[A-Za-z]\.){2,12} [a-z]", lambda m: m.group().replace(".", "-"), text
     )
     text = re.sub(r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
 

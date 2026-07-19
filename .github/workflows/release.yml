@@ -1,295 +1,147 @@
-name: Create Release and Publish Docker Images
+# Fieldnote-Echo/Kokoro-FastAPI — Hardened GHCR Release
+# Replaces upstream's multi-arch bake workflow with a GPU-only, amd64-only
+# build that includes supply-chain hardening (pinned actions, Sigstore
+# attestation, Trivy scan, CycloneDX SBOM).
+#
+# Incorporates from upstream's reworked release workflow: concurrency group,
+# duplicate-release guard, ubuntu-24.04 runner, and the new multi-stage
+# docker/gpu/Dockerfile.optimized build context.
+#
+# Triggers: tag push (v*) or manual dispatch.
+
+name: Release GPU Image
 
 on:
   push:
-    branches:
-      - release # Auto-trigger only on release branch
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-  workflow_dispatch: # Manual trigger - explicitly specify branch
-    inputs:
-      branch_name:
-        description: 'Branch to build from (required)'
-        required: true
-        type: string
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # GitHub Release creation
+  packages: write        # GHCR push
+  id-token: write        # Sigstore OIDC
+  security-events: write # SARIF upload
+  attestations: write    # Build provenance
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.branch_name || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  prepare-release:
+  build-and-release:
     runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.get-version.outputs.version }}
-      version_tag: ${{ steps.get-version.outputs.version_tag }}
-      source_ref: ${{ steps.resolve-ref.outputs.source_ref }}
+    env:
+      IMAGE: ghcr.io/fieldnote-echo/kokoro-fastapi-gpu
     steps:
-      - name: Resolve source ref
-        id: resolve-ref
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "source_ref=${{ inputs.branch_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "source_ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      # ── Runner hardening ──────────────────────────────────────────────
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
         with:
-          ref: ${{ steps.resolve-ref.outputs.source_ref }}
-          fetch-depth: 0
+          egress-policy: audit
 
-      - name: Get version from VERSION file
-        id: get-version
+      # ── Checkout ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # ── Guard: don't re-publish an existing release ───────────────────
+      - name: Check release does not exist
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION_PLAIN=$(cat VERSION)
-          BRANCH_NAME="${{ steps.resolve-ref.outputs.source_ref }}"
-
-          if [[ "$BRANCH_NAME" == "release" ]]; then
-            echo "version=${VERSION_PLAIN}" >> $GITHUB_OUTPUT
-            echo "version_tag=v${VERSION_PLAIN}" >> $GITHUB_OUTPUT
-          else
-            SAFE_BRANCH=$(echo "$BRANCH_NAME" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-            echo "version=${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
-            echo "version_tag=v${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Check tag does not exist
-        run: |
-          TAG_NAME="${{ steps.get-version.outputs.version_tag }}"
-          git fetch --tags
-          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-            echo "::error::Tag $TAG_NAME already exists. Please increment the version in the VERSION file."
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::Release ${{ github.ref_name }} already exists. Push a new tag to publish a new release."
             exit 1
           fi
 
-  build-images:
-    needs: prepare-release
-    permissions:
-      packages: write
-    env:
-      DOCKER_BUILDKIT: 1
-      BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
-      VERSION: ${{ needs.prepare-release.outputs.version_tag }}
-      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
-      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
-    strategy:
-      matrix:
-        include:
-          - build_target: "cpu"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-24.04"
-          - build_target: "gpu"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-24.04"
-          - build_target: "gpu-cu128"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-24.04"
-          - build_target: "cpu"
-            platform: "linux/arm64"
-            runs_on: "ubuntu-24.04-arm"
-          - build_target: "gpu"
-            platform: "linux/arm64"
-            runs_on: "ubuntu-24.04-arm"
-          - build_target: "rocm"
-            platform: "linux/amd64"
-            runs_on: "ubuntu-24.04"
-    runs-on: ${{ matrix.runs_on }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.prepare-release.outputs.source_ref }}
-
+      # ── Free disk space (CUDA images are ~12 GB) ──────────────────────
       - name: Free disk space
         run: |
-          echo "Listing current disk space"
-          df -h
-          echo "Cleaning up disk space..."
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           docker system prune -af
-          echo "Disk space after cleanup"
-          df -h
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver-opts: |
-            image=moby/buildkit:v0.21.1
-            network=host
+      # ── Docker Buildx ─────────────────────────────────────────────────
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+      # ── GHCR login ────────────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push single-platform image
-        run: |
-          PLATFORM="${{ matrix.platform }}"
-          BUILD_TARGET="${{ matrix.build_target }}"
-          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
-
-          echo "Building ${PLATFORM} image for ${BUILD_TARGET} version ${VERSION_TAG}"
-
-          TARGET="${BUILD_TARGET}-$(echo ${PLATFORM} | cut -d'/' -f2)"
-          echo "Using bake target: $TARGET"
-
-          # Bake reads REVISION/CREATED as HCL variables; both populate
-          # org.opencontainers.image.* labels and annotations on the per-arch push.
-          export REVISION="${GITHUB_SHA}"
-          export CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-          docker buildx bake $TARGET --push --progress=plain \
-            --set "*.cache-from=type=gha,scope=${TARGET}" \
-            --set "*.cache-to=type=gha,mode=max,scope=${TARGET}"
-
-  create-manifests:
-    needs: [prepare-release, build-images]
-    runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-    env:
-      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
-      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
-    strategy:
-      matrix:
-        build_target: ["cpu", "gpu", "gpu-cu128", "rocm"]
-    steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+      # ── Image metadata (semver tags + latest) ─────────────────────────
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
 
-      - name: Create multi-platform manifest
-        run: |
-          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
-          TARGET="${{ matrix.build_target }}"
-          REGISTRY="${{ env.REGISTRY }}"
-          OWNER="${{ env.OWNER }}"
-          REPO="${{ env.REPO }}"
-
-          # Resolve the package name, manifest tag(s), and source images per target.
-          #
-          # Tag layout per target:
-          #  - cpu:        :VERSION + :latest                         (multi-arch)
-          #  - gpu:        :VERSION + :VERSION-cu126 + :latest + :latest-cu126
-          #                  (the -cu126 aliases make the wheel variant explicit so
-          #                  Maxwell/Pascal users can pin it across future default flips)
-          #  - gpu-cu128:  :VERSION-cu128 + :latest-cu128             (amd64 only)
-          #  - rocm:       :VERSION + :latest                         (amd64 only)
-          #
-          # MANIFEST_TAGS / LATEST_TAGS are space-separated lists; all entries point at
-          # the same SOURCES so the underlying blobs are deduplicated by digest.
-          #
-          # TITLE / DESCRIPTION are attached as index-level OCI annotations.
-          # GHCR reads org.opencontainers.image.description from the index manifest
-          # for multi-arch packages, so the per-arch labels set by bake are not
-          # enough on their own.
-          case "$TARGET" in
-            gpu-cu128)
-              PACKAGE="${REPO}-gpu"
-              MANIFEST_TAGS="${VERSION_TAG}-cu128"
-              LATEST_TAGS="latest-cu128"
-              SOURCES=("${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu128-amd64")
-              TITLE="Kokoro-FastAPI (GPU, cu128 / Blackwell)"
-              DESCRIPTION="Kokoro TTS served via FastAPI. NVIDIA GPU build with CUDA 12.8 + cu128 torch wheels for RTX 50-series (Blackwell, sm_120). amd64 only."
-              ;;
-            gpu)
-              PACKAGE="${REPO}-gpu"
-              MANIFEST_TAGS="${VERSION_TAG} ${VERSION_TAG}-cu126"
-              LATEST_TAGS="latest latest-cu126"
-              # Per-arch sources carry their wheel variant (cu126 amd64, cu129 arm64);
-              # both feed the same multi-arch manifest tags above.
-              SOURCES=(
-                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu126-amd64"
-                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu129-arm64"
-              )
-              TITLE="Kokoro-FastAPI (GPU)"
-              DESCRIPTION="Kokoro TTS served via FastAPI. NVIDIA GPU build, multi-arch (CUDA 12.6 + cu126 wheels on amd64, CUDA 12.9 + cu129 wheels on arm64). See the -cu128 tag for Blackwell."
-              ;;
-            rocm)
-              PACKAGE="${REPO}-rocm"
-              MANIFEST_TAGS="${VERSION_TAG}"
-              LATEST_TAGS="latest"
-              SOURCES=("${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-amd64")
-              TITLE="Kokoro-FastAPI (ROCm)"
-              DESCRIPTION="Kokoro TTS served via FastAPI. AMD ROCm build. amd64 only."
-              ;;
-            *)
-              PACKAGE="${REPO}-${TARGET}"
-              MANIFEST_TAGS="${VERSION_TAG}"
-              LATEST_TAGS="latest"
-              SOURCES=(
-                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-amd64"
-                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-arm64"
-              )
-              TITLE="Kokoro-FastAPI (CPU)"
-              DESCRIPTION="Kokoro TTS served via FastAPI. CPU build, multi-arch (amd64 + arm64)."
-              ;;
-          esac
-
-          # Common index annotations. `index:` is required so these land on the
-          # index manifest itself, not on per-platform descriptors inside it.
-          SOURCE_URL="https://github.com/${OWNER}/Kokoro-FastAPI"
-          CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          REVISION="${GITHUB_SHA}"
-          ANNOTATIONS=(
-            --annotation "index:org.opencontainers.image.title=${TITLE}"
-            --annotation "index:org.opencontainers.image.description=${DESCRIPTION}"
-            --annotation "index:org.opencontainers.image.source=${SOURCE_URL}"
-            --annotation "index:org.opencontainers.image.url=${SOURCE_URL}"
-            --annotation "index:org.opencontainers.image.licenses=Apache-2.0"
-            --annotation "index:org.opencontainers.image.version=${VERSION_TAG}"
-            --annotation "index:org.opencontainers.image.revision=${REVISION}"
-            --annotation "index:org.opencontainers.image.created=${CREATED}"
-          )
-
-          for TAG in $MANIFEST_TAGS; do
-            docker buildx imagetools create \
-              "${ANNOTATIONS[@]}" \
-              -t ${REGISTRY}/${OWNER}/${PACKAGE}:${TAG} \
-              "${SOURCES[@]}"
-          done
-
-          # Publish the rolling tag(s) only for clean release tags (no branch suffix).
-          if [[ "$VERSION_TAG" != *"-"* ]]; then
-            for TAG in $LATEST_TAGS; do
-              docker buildx imagetools create \
-                "${ANNOTATIONS[@]}" \
-                -t ${REGISTRY}/${OWNER}/${PACKAGE}:${TAG} \
-                "${SOURCES[@]}"
-            done
-          fi
-
-  create-release:
-    needs: [prepare-release, create-manifests]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      # ── Build & push ──────────────────────────────────────────────────
+      # CUDA base images are pinned by digest, mirroring docker-bake.hcl's
+      # gpu-amd64 target (CUDA 12.6.3). Keep these in sync with the bake file;
+      # refresh with: docker buildx imagetools inspect nvcr.io/nvidia/cuda:<tag>
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          fetch-depth: 0
+          context: .
+          file: docker/gpu/Dockerfile.optimized
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CUDA_VERSION=12.6.3
+            CUDA_BUILDER_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04@sha256:50efab398f76258daa91ceebb33b6467e40217c67ea44fb5a2cebc6be7d9cce3
+            CUDA_RUNTIME_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+      # ── Sigstore build provenance ─────────────────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── Trivy container scan ──────────────────────────────────────────
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ── CycloneDX SBOM ───────────────────────────────────────────────
+      - name: Generate SBOM
+        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      # ── GitHub Release ────────────────────────────────────────────────
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.version_tag }}
-          target_commitish: ${{ needs.prepare-release.outputs.source_ref }}
-          name: Release ${{ needs.prepare-release.outputs.version_tag }}
-          body: |
-            Curated summary: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.prepare-release.outputs.version_tag }}/CHANGELOG.md)
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+        if: startsWith(github.ref, 'refs/tags/')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes \
+            sbom.cdx.json

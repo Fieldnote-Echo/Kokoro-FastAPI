@@ -1,0 +1,13 @@
+# Dependabot — GitHub Actions only.
+# Python deps are managed by upstream; we stay in sync via git merge.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      ci-actions:
+        patterns:
+          - "*"

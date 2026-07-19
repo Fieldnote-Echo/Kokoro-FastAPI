@@ -1,3 +1,19 @@
+> **Fieldnote-Echo fork** of [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) (currently based on `v0.6.0`)
+>
+> **Goal: correct, open, tunable narration.** Kokoro can *say* words but can't yet
+> *guarantee* it says them correctly, and no open TTS gives authors real control over
+> pronunciation. This fork is building that layer — correct-by-default pronunciation
+> and prosody, tunable when it isn't — aimed at technical/e-learning narration. Not a
+> naturalness contest, not singing. See [`ROADMAP.md`](./ROADMAP.md) and [`NORTH_STAR.md`](./NORTH_STAR.md).
+>
+> **Shipping today:**
+> - **Markdown-aware TTS normalization** — strips `**bold**`, `[links](url)`, headings, code blocks, tables, etc. before synthesis so LLM output sounds natural (toggle: `markdown_normalization` in `NormalizationOptions`, default on)
+> - **Supply-chain hardened CI** — CUDA base images pinned by digest (`docker-bake.hcl` + release workflow), all GitHub Actions SHA-pinned, Sigstore build provenance, Trivy scan, CycloneDX SBOM per release
+> - **Normalizer ReDoS hardening** — bounded the URL/email/markdown patterns that let a single request pin the event loop (also upstreamed: [remsky#489](https://github.com/remsky/Kokoro-FastAPI/pull/489))
+> - **GHCR images** — `ghcr.io/fieldnote-echo/kokoro-fastapi-gpu` (GPU, amd64)
+>
+> Generally-useful fixes are contributed back upstream; we rebase on `remsky/master` periodically.
+
 <p align="center">
   <img src="githubbanner.png" alt="Kokoro TTS Banner">
 </p>

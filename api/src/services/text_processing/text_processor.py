@@ -8,7 +8,7 @@ from loguru import logger
 
 from ...core.config import settings
 from ...structures.schemas import NormalizationOptions
-from .normalizer import normalize_text
+from .normalizer import handle_markdown, normalize_text
 from .phonemizer import phonemize
 from .vocabulary import tokenize
 
@@ -173,11 +173,34 @@ async def smart_split(
                 if lang_code in ["a", "b", "en-us", "en-gb"]:
                     processed_text = CUSTOM_PHONEMES.split(processed_text)
                     for index in range(0, len(processed_text), 2):
-                        processed_text[index] = normalize_text(
-                            processed_text[index], normalization_options
+                        segment = processed_text[index]
+                        normalized = normalize_text(segment, normalization_options)
+                        # Segments are rejoined with ''.join below, so any edge
+                        # whitespace the normalizer eats would glue words onto
+                        # the adjacent custom phoneme tokens — restore it.
+                        if segment[:1].isspace() and not normalized[:1].isspace():
+                            normalized = " " + normalized
+                        if segment[-1:].isspace() and not normalized[-1:].isspace():
+                            normalized = normalized + " "
+                        processed_text[index] = normalized
+
+                    # Strip once on the final joined result, never per segment
+                    processed_text = "".join(processed_text).strip()
+                elif normalization_options.markdown_normalization:
+                    # Markdown syntax is language-independent — strip it even
+                    # when English-specific normalization is skipped. Custom
+                    # phoneme tokens look like markdown links, so protect them.
+                    processed_text = CUSTOM_PHONEMES.split(processed_text)
+                    for index in range(0, len(processed_text), 2):
+                        processed_text[index] = handle_markdown(
+                            processed_text[index]
                         )
 
                     processed_text = "".join(processed_text).strip()
+                    logger.info(
+                        "Applied markdown normalization only; full text "
+                        "normalization is only supported for english"
+                    )
                 else:
                     logger.info(
                         "Skipping text normalization as it is only supported for english"

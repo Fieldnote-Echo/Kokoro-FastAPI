@@ -133,11 +133,17 @@ target "cpu-arm64" {
     ]
 }
 
+# CUDA base images pinned by digest (index/manifest-list digests) to prevent
+# supply-chain substitution of the mutable version tags. The Dockerfile defaults
+# stay unpinned so plain `docker build` / compose builds keep working.
+# Refresh with: docker buildx imagetools inspect nvcr.io/nvidia/cuda:<tag>
 target "gpu-amd64" {
     inherits = ["_gpu_base"]
     platforms = ["linux/amd64"]
     args = {
         CUDA_VERSION = "12.6.3"
+        CUDA_BUILDER_IMAGE = "nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04@sha256:50efab398f76258daa91ceebb33b6467e40217c67ea44fb5a2cebc6be7d9cce3"
+        CUDA_RUNTIME_IMAGE = "nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356"
     }
     # Per-arch tag carries the wheel variant so it parallels gpu-cu128-amd64.
     # The published manifest still resolves to :VERSION / :VERSION-cu126 via release.yml.
@@ -151,6 +157,8 @@ target "gpu-arm64" {
     platforms = ["linux/arm64"]
     args = {
         CUDA_VERSION = "12.9.1"
+        CUDA_BUILDER_IMAGE = "nvcr.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:a2e1e2360c85298ac47ec2543b406ab1e8cec42e31ee47e4d32140ebc82e1067"
+        CUDA_RUNTIME_IMAGE = "nvcr.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04@sha256:d02c4310b6d57ca0b16cd80298bdb33a74187baafe2eccd8a6a16180ddc90802"
     }
     # aarch64 uses cu129 wheels (no cu126 aarch64 wheels exist on pytorch.org).
     tags = [
@@ -167,6 +175,8 @@ target "gpu-cu128-amd64" {
         # 12.8.x is the first CUDA toolkit with Blackwell (sm_120) support and is
         # what the cu128 torch wheels are built against. Keep base + wheel aligned.
         CUDA_VERSION = "12.8.1"
+        CUDA_BUILDER_IMAGE = "nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04@sha256:24c8e3581ea6330038b0d374920721983312627f8adbfcf390bdb4b399d280ed"
+        CUDA_RUNTIME_IMAGE = "nvcr.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc"
         GPU_EXTRA = "gpu-cu128"
     }
     tags = [
