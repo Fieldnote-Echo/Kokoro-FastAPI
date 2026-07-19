@@ -1,46 +1,91 @@
-# Fieldnote-Echo/Kokoro-FastAPI — Hardened GHCR Release
-# Replaces upstream's multi-arch bake workflow with a GPU-only, amd64-only
-# build that includes supply-chain hardening (pinned actions, egress
-# enforcement, Sigstore attestation, gating Trivy scan, attested SBOM).
+# Create Release and Publish Docker Images (hardened)
 #
-# Incorporates from upstream's reworked release workflow: concurrency group,
-# duplicate-release guard, ubuntu-24.04 runner, and the new multi-stage
-# docker/gpu/Dockerfile.optimized build context.
+# Structure mirrors upstream's matrix pipeline, split into 5 jobs:
+#   prepare-release
+#     -> build-images (6-leg matrix: build + GATED Trivy scan + push)
+#       -> create-manifests (per-package immutable :VERSION-family tags + attest)
+#         -> promote-latest (rolling :latest* tags, gated on ALL packages)
+#           -> create-release
+# Layered on top is our supply-chain hardening:
+#   - every `uses:` SHA-pinned with a version comment
+#   - step-security/harden-runner (egress-policy: block) as the first step of every job
+#   - a GATED Trivy scan per matrix leg BEFORE the image is pushed
+#   - Sigstore build-provenance + SBOM attestation of the published multi-arch index
+#   - persist-credentials: false on every checkout, least-privilege permissions per job
 #
-# Triggers: tag push (v*) or manual dispatch.
+# NOTE ON harden-runner FIRST-RUN TUNING: egress-policy: block fails closed. If a
+# build reaches a new host (a new PyPI mirror, a moved CDN shard, etc.) the run
+# fails and harden-runner prints the exact "Blocked" host in the job log and on the
+# run's insights page. Add that host to the relevant job's allowed-endpoints list and
+# re-run. The lists below cover the known egress of every matrix leg. Some build
+# traffic (OS apt mirrors) is plain HTTP, hence the :80 entries in build-images.
+#
+# NOTE ON ARM64: the arm64 legs run on native ubuntu-24.04-arm. harden-runner
+# egress enforcement is eBPF-based; egress-policy is driven from a matrix field
+# (`egress_policy`) so a leg can be flipped to `audit` if a future runner image
+# ever lacks block-mode support, without weakening the amd64 legs.
+#
+# NOTE ON THE TRIVY GATE / BREAK-GLASS: the gate fails a leg on any *fixable*
+# CRITICAL (ignore-unfixed: true). Because the CUDA/CPU/ROCm bases are digest-pinned
+# in docker-bake.hcl but Trivy's vuln DB refreshes every run, a release that
+# passes today can fail weeks later with no code change once upstream ships a fix
+# the frozen base has not taken. Recovery / break-glass, in order of preference:
+#   1. Refresh the CUDA/ROCm base digests in docker-bake.hcl as part of release
+#      prep so the fix is actually applied, then re-tag.
+#   2. If a specific fixable CRITICAL is unactionable for this release, commit a
+#      time-boxed, commented `.trivyignore` at the repo root and wire it into the
+#      gate step via `trivyignores: .trivyignore` (line is present but commented
+#      below). Keep entries dated and pruned.
+# A re-run after either change is the intended recovery (build cache makes it fast).
+# Orphaned per-arch tags (e.g. ...-cpu:vX-amd64) left by a leg that pushed before a
+# sibling tripped the gate are expected, non-consumer-facing debris.
 
-name: Release GPU Image
+name: Create Release and Publish Docker Images
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - release # Auto-trigger only on release branch
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch: # Manual trigger - explicitly specify branch
+    inputs:
+      branch_name:
+        description: 'Branch to build from (required)'
+        required: true
+        type: string
 
+# Least-privilege default; each job widens only what it needs.
 permissions:
-  contents: write        # GitHub Release creation
-  packages: write        # GHCR push
-  id-token: write        # Sigstore OIDC
-  security-events: write # SARIF upload
-  attestations: write    # Build provenance + SBOM attestation
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.branch_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
+  # ────────────────────────────────────────────────────────────────────────
+  # 1. Resolve the version from the VERSION file and guard against re-tagging.
+  # ────────────────────────────────────────────────────────────────────────
+  prepare-release:
     runs-on: ubuntu-24.04
-    env:
-      IMAGE: ghcr.io/fieldnote-echo/kokoro-fastapi-gpu
-      SCAN_TAG: ghcr.io/fieldnote-echo/kokoro-fastapi-gpu:ci-scan  # local-only, never pushed
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      version_tag: ${{ steps.get-version.outputs.version_tag }}
+      source_ref: ${{ steps.resolve-ref.outputs.source_ref }}
+      # Immutable commit the whole run builds/scans/attests/tags. Every
+      # downstream checkout, OCI revision label, and the GitHub Release's
+      # target_commitish use this, so a branch advancing mid-run cannot make
+      # jobs disagree about which commit they published.
+      source_sha: ${{ steps.resolve-sha.outputs.source_sha }}
+      # One build timestamp for the whole run, so the scanned image, the pushed
+      # per-arch images, and the index annotations all share an identical
+      # org.opencontainers.image.created value (bit-identical scan vs push).
+      created: ${{ steps.get-version.outputs.created }}
     steps:
-      # ── Runner hardening ──────────────────────────────────────────────
-      # egress-policy: block — the runner may only reach the endpoints below.
-      # Derived from this workflow's known egress (GitHub/GHCR, PyPI, PyTorch,
-      # NVIDIA NGC, Hugging Face model download, Sigstore, Trivy DB). If a
-      # release fails with a "Blocked" egress line, add the reported host here;
-      # harden-runner fails closed and names the exact host.
       - name: Harden runner
         uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
         with:
@@ -48,9 +93,160 @@ jobs:
           allowed-endpoints: >
             github.com:443
             api.github.com:443
-            objects.githubusercontent.com:443
             codeload.github.com:443
+            objects.githubusercontent.com:443
+
+      # inputs.branch_name is attacker-controllable (workflow_dispatch, no format
+      # constraint). Pass every context value through env and reference the shell
+      # variable inside run: — never splice ${{ }} into the script text.
+      - name: Resolve source ref
+        id: resolve-ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_BRANCH: ${{ inputs.branch_name }}
+          PUSH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "source_ref=${DISPATCH_BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_ref=${PUSH_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.resolve-ref.outputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pin the run to the exact commit the branch resolved to right now.
+      - name: Resolve source commit SHA
+        id: resolve-sha
+        run: |
+          set -euo pipefail
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Get version from VERSION file
+        id: get-version
+        env:
+          BRANCH_NAME: ${{ steps.resolve-ref.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          VERSION_PLAIN=$(cat VERSION)
+
+          if [[ "$BRANCH_NAME" == "release" ]]; then
+            echo "version=${VERSION_PLAIN}" >> "$GITHUB_OUTPUT"
+            echo "version_tag=v${VERSION_PLAIN}" >> "$GITHUB_OUTPUT"
+          else
+            # Allowlist to characters valid in an OCI tag component: lowercase,
+            # map '/' to '-', then strip anything outside [a-z0-9._-]. This is
+            # both defense-in-depth for the injection surface above and a guard
+            # against tag-parse failures in bake/imagetools downstream.
+            SAFE_BRANCH=$(echo "$BRANCH_NAME" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+            echo "version=${VERSION_PLAIN}-${SAFE_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "version_tag=v${VERSION_PLAIN}-${SAFE_BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag does not exist
+        env:
+          TAG_NAME: ${{ steps.get-version.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          # No `git fetch --tags` here: the checkout above uses fetch-depth: 0,
+          # which already fetched all tags, and persist-credentials: false means
+          # a fresh fetch would run unauthenticated (and fail on a private repo).
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG_NAME already exists. Please increment the version in the VERSION file."
+            exit 1
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 2. Build each per-arch image, GATE it with Trivy, then push (cache hit).
+  #    The full upstream 6-entry matrix; gpu-cu128 and rocm are amd64-only,
+  #    arm64 legs run on native ubuntu-24.04-arm runners.
+  # ────────────────────────────────────────────────────────────────────────
+  build-images:
+    needs: prepare-release
+    permissions:
+      contents: read
+      packages: write        # bake --push to GHCR
+      security-events: write # upload Trivy SARIF to the Security tab
+    env:
+      DOCKER_BUILDKIT: 1
+      BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
+      VERSION: ${{ needs.prepare-release.outputs.version_tag }}
+      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
+      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
+      # Local-only tag used to load the built image for scanning. Never pushed;
+      # the real (bake-defined) tags are used by the separate --push step.
+      SCAN_IMAGE: local/kokoro-scan:${{ matrix.build_target }}-scan
+    strategy:
+      # fail-fast: false so every leg is built, scanned and reports its SARIF
+      # even if a sibling leg's gate fails. A gate failure still fails this job,
+      # which (via needs:) blocks create-manifests -> no partial release is
+      # published. A failing gate on one leg only stops THAT leg's push, because
+      # the push step runs after the gate in the same leg.
+      fail-fast: false
+      matrix:
+        include:
+          - build_target: "cpu"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-24.04"
+            egress_policy: "block"
+          - build_target: "gpu"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-24.04"
+            egress_policy: "block"
+          - build_target: "gpu-cu128"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-24.04"
+            egress_policy: "block"
+          - build_target: "cpu"
+            platform: "linux/arm64"
+            runs_on: "ubuntu-24.04-arm"
+            egress_policy: "block"
+          - build_target: "gpu"
+            platform: "linux/arm64"
+            runs_on: "ubuntu-24.04-arm"
+            egress_policy: "block"
+          - build_target: "rocm"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-24.04"
+            egress_policy: "block"
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      # egress-policy: block. This list must cover every leg's BUILD-time egress
+      # (buildx uses network=host, so build-container traffic traverses the
+      # monitored host namespace). Grouped by purpose:
+      #   GitHub/GHCR/Actions-cache; PyPI + torch wheels; the uv installer
+      #   (astral.sh -> releases.astral.sh, binary then fetched from GitHub);
+      #   the Rust toolchain (sh.rustup.rs -> static.rust-lang.org, for the cpu
+      #   legs building sudachipy/pyopenjtalk); OS apt mirrors (Debian for the
+      #   cpu base, Ubuntu for the CUDA/ROCm bases, on port 80 not 443) plus the
+      #   CUDA apt repo (developer.download.nvidia.com); the ROCm apt repo
+      #   (repo.radeon.com) and archlinux archive (rocblas pin, rocm leg); the
+      #   UniDic dictionary (index on raw.githubusercontent.com, ~500MB zip on
+      #   cotonoha-dic S3, all legs); nvcr.io (CUDA base images); Docker Hub
+      #   (moby/buildkit driver image); and the Trivy DB (ghcr.io + mirror.gcr.io
+      #   fallback). The Kokoro model is pulled from GitHub release assets
+      #   (objects/release-assets.githubusercontent.com) — no Hugging Face host
+      #   is touched by the build, so none are listed. See the first-run tuning
+      #   note at the top of this file.
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: ${{ matrix.egress_policy }}
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
             release-assets.githubusercontent.com:443
+            raw.githubusercontent.com:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
             actions-results-receiver-production.githubapp.com:443
@@ -58,167 +254,475 @@ jobs:
             pypi.org:443
             files.pythonhosted.org:443
             download.pytorch.org:443
+            astral.sh:443
+            releases.astral.sh:443
+            sh.rustup.rs:443
+            static.rust-lang.org:443
+            archive.archlinux.org:443
+            cotonoha-dic.s3-ap-northeast-1.amazonaws.com:443
             nvcr.io:443
-            huggingface.co:443
-            cdn-lfs.huggingface.co:443
-            cdn-lfs-us-1.hf.co:443
-            fulcio.sigstore.dev:443
-            rekor.sigstore.dev:443
-            tuf-repo-cdn.sigstore.dev:443
+            developer.download.nvidia.com:443
+            repo.radeon.com:443
+            deb.debian.org:80
+            security.debian.org:80
+            archive.ubuntu.com:80
+            security.ubuntu.com:80
+            ports.ubuntu.com:80
             mirror.gcr.io:443
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
 
-      # ── Checkout ──────────────────────────────────────────────────────
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          persist-credentials: false  # don't leave the token in .git/config for later steps
+          ref: ${{ needs.prepare-release.outputs.source_sha }}
+          persist-credentials: false
 
-      # ── Guard: don't re-publish an existing release ───────────────────
-      - name: Check release does not exist
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::error::Release ${{ github.ref_name }} already exists. Push a new tag to publish a new release."
-            exit 1
-          fi
-
-      # ── Free disk space (CUDA images are ~12 GB) ──────────────────────
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          set -euo pipefail
+          echo "Listing current disk space"
+          df -h
+          echo "Cleaning up disk space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           docker system prune -af
+          echo "Disk space after cleanup"
+          df -h
 
-      # ── Docker Buildx ─────────────────────────────────────────────────
-      - name: Set up Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.21.1
+            network=host
 
-      # ── GHCR login ────────────────────────────────────────────────────
-      - name: Log in to GHCR
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Image metadata (semver tags + latest) ─────────────────────────
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
-
-      # ── Build for scanning (load locally, DO NOT push yet) ────────────
-      # CUDA base images are pinned by digest, mirroring docker-bake.hcl's
-      # gpu-amd64 target (CUDA 12.6.3). Keep these in sync with the bake file;
-      # refresh with: docker buildx imagetools inspect nvcr.io/nvidia/cuda:<tag>
-      - name: Build image (load for scan)
+      # Build the single-platform target and LOAD it locally under SCAN_IMAGE.
+      # Digest pins for the CUDA bases live in docker-bake.hcl (no inline
+      # build-args). `*.tags` is overridden to the local scan tag so we can hand
+      # a concrete ref to Trivy; the push step below uses bake's real tags. Tags
+      # are not part of the buildkit cache key, so overriding them here does not
+      # cost a rebuild on push. REVISION/CREATED are read by bake as HCL vars
+      # from the environment; CREATED comes from prepare-release so the scanned
+      # image and the pushed image carry the identical created label.
+      - name: Build image locally for scanning
         id: build_scan
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: docker/gpu/Dockerfile.optimized
-          platforms: linux/amd64
-          load: true
-          push: false
-          build-args: |
-            CUDA_VERSION=12.6.3
-            CUDA_BUILDER_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04@sha256:50efab398f76258daa91ceebb33b6467e40217c67ea44fb5a2cebc6be7d9cce3
-            CUDA_RUNTIME_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356
-          tags: ${{ env.SCAN_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          REVISION: ${{ needs.prepare-release.outputs.source_sha }}
+          CREATED: ${{ needs.prepare-release.outputs.created }}
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_TARGET: ${{ matrix.build_target }}
+        run: |
+          set -euo pipefail
+          ARCH="${PLATFORM##*/}"
+          TARGET="${BUILD_TARGET}-${ARCH}"
+          echo "Baking ${TARGET} -> local scan image ${SCAN_IMAGE}"
+          docker buildx bake "${TARGET}" \
+            --set "*.tags=${SCAN_IMAGE}" \
+            --set "*.cache-from=type=gha,scope=${TARGET}" \
+            --set "*.cache-to=type=gha,mode=max,scope=${TARGET}" \
+            --load --progress=plain
 
-      # ── Trivy: GATE the release (fail on fixable CRITICAL) ────────────
-      # Runs BEFORE push so a vulnerable image is never published. ignore-unfixed
-      # avoids blocking on CVEs in the CUDA/OS base that have no available fix;
-      # gate on CRITICAL only (HIGH is reported below but non-blocking, since
-      # CUDA base layers routinely carry unactionable HIGH advisories).
+      # GATE: fail the leg on fixable CRITICAL vulnerabilities before any push.
+      # ignore-unfixed avoids blocking on CUDA/OS base CVEs that have no fix yet.
+      # See the break-glass note at the top of this file. To suppress a specific
+      # unactionable-but-fixable CVE for a release, commit a dated .trivyignore
+      # and uncomment the `trivyignores:` line below.
       - name: Trivy scan (gate)
-        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # v0.34.0
         with:
-          image-ref: ${{ env.SCAN_TAG }}
+          image-ref: ${{ env.SCAN_IMAGE }}
           format: table
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          # trivyignores: .trivyignore
 
-      # ── Trivy: full report to the Security tab (non-blocking) ─────────
+      # Full report (CRITICAL + HIGH) to the Security tab. Non-blocking; runs
+      # even when the gate above failed so the findings are always visible.
       - name: Trivy scan (SARIF report)
         if: always() && steps.build_scan.outcome == 'success'
-        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        continue-on-error: true  # reporting is non-blocking; must not skip the push
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # v0.34.0
         with:
-          image-ref: ${{ env.SCAN_TAG }}
+          image-ref: ${{ env.SCAN_IMAGE }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
 
       - name: Upload Trivy SARIF
         if: always() && hashFiles('trivy-results.sarif') != ''
+        continue-on-error: true  # a Code Scanning outage must not block a gated-clean release
         uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
         with:
           sarif_file: trivy-results.sarif
+          # Unique category per leg so parallel uploads do not overwrite each other.
+          category: trivy-${{ matrix.build_target }}-${{ matrix.platform }}
 
-      # ── Push (only reached if the gate scan passed) ───────────────────
-      # Reuses the layers built above via the GHA cache, so this is a fast
-      # cache hit rather than a second full build.
+      # Reclaim the ~12GB scan image (only the docker daemon copy; the GHA build
+      # cache is untouched) before the push so heavy CUDA legs — gpu-arm64 in
+      # particular — do not run the ubuntu-24.04-arm runner out of disk. Runs
+      # only when the gate passed (a failed gate stops the job before here).
+      - name: Reclaim scan image disk before push
+        run: |
+          set -euo pipefail
+          docker image rm "$SCAN_IMAGE" || true
+          docker image prune -f || true
+          df -h
+
+      # Only reached when the gate passed. The GHA cache populated by the scan
+      # build above makes this a cache hit rather than a second full build.
+      # CREATED is reused from prepare-release so the pushed image's created
+      # label is bit-identical to the scanned image's.
       - name: Build and push
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: docker/gpu/Dockerfile.optimized
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            CUDA_VERSION=12.6.3
-            CUDA_BUILDER_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04@sha256:50efab398f76258daa91ceebb33b6467e40217c67ea44fb5a2cebc6be7d9cce3
-            CUDA_RUNTIME_IMAGE=nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          REVISION: ${{ needs.prepare-release.outputs.source_sha }}
+          CREATED: ${{ needs.prepare-release.outputs.created }}
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_TARGET: ${{ matrix.build_target }}
+        run: |
+          set -euo pipefail
+          ARCH="${PLATFORM##*/}"
+          TARGET="${BUILD_TARGET}-${ARCH}"
+          echo "Pushing bake target ${TARGET}"
+          docker buildx bake "${TARGET}" \
+            --set "*.cache-from=type=gha,scope=${TARGET}" \
+            --set "*.cache-to=type=gha,mode=max,scope=${TARGET}" \
+            --push --progress=plain
 
-      # ── Sigstore build provenance ─────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────
+  # 3. Assemble multi-arch manifests for the IMMUTABLE :VERSION-family tags,
+  #    then attest provenance + SBOM of the published index. One matrix leg per
+  #    logical package/tag family. Rolling :latest* tags are deferred to the
+  #    promote-latest job so they only move once EVERY package's version tags
+  #    and attestations exist.
+  # ────────────────────────────────────────────────────────────────────────
+  create-manifests:
+    needs: [prepare-release, build-images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write      # imagetools create + push attestations to GHCR
+      id-token: write      # Sigstore OIDC for attestation signing
+      attestations: write  # record provenance/SBOM attestations
+    strategy:
+      # fail-fast: false so one package's manifest/attestation failure does not
+      # abort the others that already built cleanly.
+      fail-fast: false
+      matrix:
+        build_target: ["cpu", "gpu", "gpu-cu128", "rocm"]
+    env:
+      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
+      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
+    steps:
+      # egress: GHCR (manifest read/write + attestation push), GitHub (syft
+      # binary download for sbom-action), and Sigstore (fulcio/rekor/tuf).
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            fulcio.sigstore.dev:443
+            rekor.sigstore.dev:443
+            tuf-repo-cdn.sigstore.dev:443
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # matrix.build_target and version_tag flow in via env (never spliced into
+      # the run: text); REGISTRY/OWNER/REPO are already job-level env vars.
+      - name: Create multi-platform manifest
+        id: manifest
+        env:
+          VERSION_TAG: ${{ needs.prepare-release.outputs.version_tag }}
+          TARGET: ${{ matrix.build_target }}
+          CREATED: ${{ needs.prepare-release.outputs.created }}
+          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the package name, manifest tag(s), and source images per target.
+          #
+          # Tag layout per target (immutable :VERSION-family only here; :latest*
+          # is handled by promote-latest):
+          #  - cpu:        :VERSION                                   (multi-arch)
+          #  - gpu:        :VERSION + :VERSION-cu126                  (multi-arch)
+          #                  (the -cu126 alias makes the wheel variant explicit so
+          #                  Maxwell/Pascal users can pin it across future default flips)
+          #  - gpu-cu128:  :VERSION-cu128                            (amd64 only)
+          #  - rocm:       :VERSION                                   (amd64 only)
+          #
+          # MANIFEST_TAGS is a space-separated list; all entries point at the same
+          # SOURCES so the underlying blobs are deduplicated by digest.
+          #
+          # TITLE / DESCRIPTION are attached as index-level OCI annotations.
+          # GHCR reads org.opencontainers.image.description from the index manifest
+          # for multi-arch packages, so the per-arch labels set by bake are not
+          # enough on their own.
+          case "$TARGET" in
+            gpu-cu128)
+              PACKAGE="${REPO}-gpu"
+              MANIFEST_TAGS="${VERSION_TAG}-cu128"
+              SOURCES=("${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu128-amd64")
+              TITLE="Kokoro-FastAPI (GPU, cu128 / Blackwell)"
+              DESCRIPTION="Kokoro TTS served via FastAPI. NVIDIA GPU build with CUDA 12.8 + cu128 torch wheels for RTX 50-series (Blackwell, sm_120). amd64 only."
+              ;;
+            gpu)
+              PACKAGE="${REPO}-gpu"
+              MANIFEST_TAGS="${VERSION_TAG} ${VERSION_TAG}-cu126"
+              # Per-arch sources carry their wheel variant (cu126 amd64, cu129 arm64);
+              # both feed the same multi-arch manifest tags above.
+              SOURCES=(
+                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu126-amd64"
+                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-cu129-arm64"
+              )
+              TITLE="Kokoro-FastAPI (GPU)"
+              DESCRIPTION="Kokoro TTS served via FastAPI. NVIDIA GPU build, multi-arch (CUDA 12.6 + cu126 wheels on amd64, CUDA 12.9 + cu129 wheels on arm64). See the -cu128 tag for Blackwell."
+              ;;
+            rocm)
+              PACKAGE="${REPO}-rocm"
+              MANIFEST_TAGS="${VERSION_TAG}"
+              SOURCES=("${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-amd64")
+              TITLE="Kokoro-FastAPI (ROCm)"
+              DESCRIPTION="Kokoro TTS served via FastAPI. AMD ROCm build. amd64 only."
+              ;;
+            *)
+              PACKAGE="${REPO}-${TARGET}"
+              MANIFEST_TAGS="${VERSION_TAG}"
+              SOURCES=(
+                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-amd64"
+                "${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION_TAG}-arm64"
+              )
+              TITLE="Kokoro-FastAPI (CPU)"
+              DESCRIPTION="Kokoro TTS served via FastAPI. CPU build, multi-arch (amd64 + arm64)."
+              ;;
+          esac
+
+          # Common index annotations. `index:` is required so these land on the
+          # index manifest itself, not on per-platform descriptors inside it.
+          SOURCE_URL="https://github.com/${OWNER}/Kokoro-FastAPI"
+          REVISION="${SOURCE_SHA}"
+          ANNOTATIONS=(
+            --annotation "index:org.opencontainers.image.title=${TITLE}"
+            --annotation "index:org.opencontainers.image.description=${DESCRIPTION}"
+            --annotation "index:org.opencontainers.image.source=${SOURCE_URL}"
+            --annotation "index:org.opencontainers.image.url=${SOURCE_URL}"
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0"
+            --annotation "index:org.opencontainers.image.version=${VERSION_TAG}"
+            --annotation "index:org.opencontainers.image.revision=${REVISION}"
+            --annotation "index:org.opencontainers.image.created=${CREATED}"
+          )
+
+          for TAG in $MANIFEST_TAGS; do
+            docker buildx imagetools create \
+              "${ANNOTATIONS[@]}" \
+              -t "${REGISTRY}/${OWNER}/${PACKAGE}:${TAG}" \
+              "${SOURCES[@]}"
+          done
+
+          # Capture the index digest for attestation. Every MANIFEST_TAG points at
+          # the same SOURCES, so they all resolve to one index digest; inspect the
+          # first manifest tag to obtain it.
+          FIRST_TAG=$(echo "$MANIFEST_TAGS" | awk '{print $1}')
+          IMAGE_REF="${REGISTRY}/${OWNER}/${PACKAGE}"
+          INDEX_DIGEST=$(docker buildx imagetools inspect "${IMAGE_REF}:${FIRST_TAG}" --format '{{.Manifest.Digest}}')
+          echo "Index digest for ${IMAGE_REF}:${FIRST_TAG} = ${INDEX_DIGEST}"
+          {
+            echo "image=${IMAGE_REF}"
+            echo "digest=${INDEX_DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Attest provenance for the published INDEX (one attestation per package
+      # tag family). Attesting the index digest rather than each per-arch image
+      # keeps the count minimal and matches what consumers pull by tag.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ steps.manifest.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
-      # ── CycloneDX SBOM ───────────────────────────────────────────────
+      # SBOM for the same index digest. LIMITATION: syft resolves the
+      # runner-native platform (amd64) from the index, so for the multi-arch
+      # cpu/gpu packages this SBOM is amd64-representative — the arm64 sub-image
+      # (which ships a different torch build: cu129 vs cu126 on gpu) is NOT
+      # reflected in the attested component list. gpu-cu128 and rocm are amd64-only
+      # and fully covered. Provenance (digest-only) is unaffected. If per-arch SBOM
+      # coverage becomes a requirement, generate/attest an SBOM against each
+      # per-arch image digest (the -amd64/-arm64 manifests bake pushed) instead.
       - name: Generate SBOM
         uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
         with:
-          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          image: ${{ steps.manifest.outputs.image }}@${{ steps.manifest.outputs.digest }}
           format: cyclonedx-json
-          output-file: sbom.cdx.json
+          output-file: sbom-${{ matrix.build_target }}.cdx.json
 
-      # ── Attest the SBOM to the registry (verifiable, like provenance) ──
       - name: Attest SBOM
         uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
         with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: sbom.cdx.json
+          subject-name: ${{ steps.manifest.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          sbom-path: sbom-${{ matrix.build_target }}.cdx.json
           push-to-registry: true
 
-      # ── GitHub Release ────────────────────────────────────────────────
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # ────────────────────────────────────────────────────────────────────────
+  # 4. Promote the rolling :latest* tags. Runs only after EVERY create-manifests
+  #    leg succeeded (a fail-fast:false matrix job is "failed" if any leg fails,
+  #    which skips this job), so :latest is never moved for one package while
+  #    another package's version tags/attestations are missing or failed. Each
+  #    :latest* tag is copied from the already-published, already-attested
+  #    :VERSION index (imagetools create preserves the index digest and its
+  #    annotations), with a small retry to absorb transient GHCR errors.
+  #    NB: imagetools has no atomic multi-tag push, so a mid-loop failure here
+  #    can still leave :latest half-updated across packages — a re-run of this
+  #    job is the intended recovery and is idempotent.
+  # ────────────────────────────────────────────────────────────────────────
+  promote-latest:
+    needs: [prepare-release, create-manifests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
+      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
+      VERSION_TAG: ${{ needs.prepare-release.outputs.version_tag }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote rolling :latest tags
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "Release ${{ github.ref_name }}" \
-            --generate-notes \
-            sbom.cdx.json
+          set -euo pipefail
+
+          # Rolling tags only for clean release tags (no branch suffix). Branch
+          # builds get :VERSION-family tags from create-manifests but never :latest.
+          if [[ "$VERSION_TAG" == *"-"* ]]; then
+            echo "Branch build ($VERSION_TAG); skipping :latest promotion."
+            exit 0
+          fi
+
+          promote() {
+            dest="$1"
+            src="$2"
+            for attempt in 1 2 3; do
+              if docker buildx imagetools create -t "$dest" "$src"; then
+                return 0
+              fi
+              echo "imagetools create for $dest failed (attempt ${attempt}); retrying..."
+              sleep "$((attempt * 5))"
+            done
+            echo "::error::Failed to promote $dest after 3 attempts"
+            return 1
+          }
+
+          for TARGET in cpu gpu gpu-cu128 rocm; do
+            case "$TARGET" in
+              gpu-cu128)
+                PACKAGE="${REPO}-gpu"
+                SRC_TAG="${VERSION_TAG}-cu128"
+                LATEST_TAGS="latest-cu128"
+                ;;
+              gpu)
+                PACKAGE="${REPO}-gpu"
+                SRC_TAG="${VERSION_TAG}"
+                LATEST_TAGS="latest latest-cu126"
+                ;;
+              rocm)
+                PACKAGE="${REPO}-rocm"
+                SRC_TAG="${VERSION_TAG}"
+                LATEST_TAGS="latest"
+                ;;
+              *)
+                PACKAGE="${REPO}-${TARGET}"
+                SRC_TAG="${VERSION_TAG}"
+                LATEST_TAGS="latest"
+                ;;
+            esac
+            SRC_REF="${REGISTRY}/${OWNER}/${PACKAGE}:${SRC_TAG}"
+            for TAG in $LATEST_TAGS; do
+              echo "Promoting ${REGISTRY}/${OWNER}/${PACKAGE}:${TAG} <- ${SRC_REF}"
+              promote "${REGISTRY}/${OWNER}/${PACKAGE}:${TAG}" "${SRC_REF}"
+            done
+          done
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 5. Create the GitHub Release once all images/manifests/latest tags are live.
+  # ────────────────────────────────────────────────────────────────────────
+  create-release:
+    needs: [prepare-release, create-manifests, promote-latest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            uploads.github.com:443
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.version_tag }}
+          target_commitish: ${{ needs.prepare-release.outputs.source_sha }}
+          name: Release ${{ needs.prepare-release.outputs.version_tag }}
+          body: |
+            Curated summary: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.prepare-release.outputs.version_tag }}/CHANGELOG.md)
+          generate_release_notes: true
+          draft: false
+          # A suffixed version_tag (branch build via workflow_dispatch, or a
+          # prerelease VERSION like 1.2.3-rc1) contains a '-'; mark those as
+          # prereleases so a non-stable build never becomes the user-facing
+          # "Latest release" — matching promote-latest, which likewise leaves
+          # the container :latest tags on the previous stable build.
+          prerelease: ${{ contains(needs.prepare-release.outputs.version_tag, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

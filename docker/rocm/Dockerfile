@@ -1,4 +1,7 @@
-FROM rocm/dev-ubuntu-24.04:6.4.4-complete
+# Overridable so CI can pin by digest (docker-bake.hcl); tag default keeps a
+# plain `docker build` / compose build working unpinned.
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete
+FROM ${ROCM_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive \
     PHONEMIZER_ESPEAK_PATH=/usr/bin \
     PHONEMIZER_ESPEAK_DATA=/usr/share/espeak-ng-data \
