@@ -1,5 +1,10 @@
+# Base images are overridable so CI can pin them by digest (see docker-bake.hcl);
+# the tag defaults keep a plain `docker build` / compose build working unpinned.
+ARG CPU_BUILDER_IMAGE=python:3.10
+ARG CPU_RUNTIME_IMAGE=python:3.10-slim
+
 # Stage 1: Builder
-FROM python:3.10 AS builder
+FROM ${CPU_BUILDER_IMAGE} AS builder
 
 # Install build dependencies
 RUN apt-get update -y && \
@@ -24,7 +29,7 @@ RUN uv venv --python 3.10 && \
     uv sync --extra cpu --no-cache --no-install-project
 
 # Stage 2: Runtime - slim image
-FROM python:3.10-slim
+FROM ${CPU_RUNTIME_IMAGE}
 
 # Install runtime dependencies + uv (needed by entrypoint.sh)
 RUN apt-get update -y && \

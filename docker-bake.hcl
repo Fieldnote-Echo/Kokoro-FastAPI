@@ -117,9 +117,16 @@ target "_rocm_base" {
 
 
 # Individual platform targets for debugging/testing
+# CPU base images pinned by digest (multi-arch index digests, so the same pin
+# is valid for both amd64 and arm64). Dockerfile tag defaults stay unpinned for
+# plain builds; refresh with: docker buildx imagetools inspect python:3.10
 target "cpu-amd64" {
     inherits = ["_cpu_base"]
     platforms = ["linux/amd64"]
+    args = {
+        CPU_BUILDER_IMAGE = "python:3.10@sha256:eeee18553aa04180f626f320c11577b73bf6cfdb77b04894305244eb53c71d50"
+        CPU_RUNTIME_IMAGE = "python:3.10-slim@sha256:c1e4e6c01eb489c422288b2de34b0761ca316f7a2d98e2c33f47659a73ed108a"
+    }
     tags = [
         "${REGISTRY}/${OWNER}/${REPO}-cpu:${VERSION}-amd64"
     ]
@@ -128,6 +135,10 @@ target "cpu-amd64" {
 target "cpu-arm64" {
     inherits = ["_cpu_base"]
     platforms = ["linux/arm64"]
+    args = {
+        CPU_BUILDER_IMAGE = "python:3.10@sha256:eeee18553aa04180f626f320c11577b73bf6cfdb77b04894305244eb53c71d50"
+        CPU_RUNTIME_IMAGE = "python:3.10-slim@sha256:c1e4e6c01eb489c422288b2de34b0761ca316f7a2d98e2c33f47659a73ed108a"
+    }
     tags = [
         "${REGISTRY}/${OWNER}/${REPO}-cpu:${VERSION}-arm64"
     ]
@@ -184,10 +195,14 @@ target "gpu-cu128-amd64" {
     ]
 }
 
-# AMD ROCm only supports x86
+# AMD ROCm only supports x86. Base pinned by digest; Dockerfile tag default
+# stays unpinned. Refresh: docker buildx imagetools inspect rocm/dev-ubuntu-24.04:6.4.4-complete
 target "rocm-amd64" {
     inherits = ["_rocm_base"]
     platforms = ["linux/amd64"]
+    args = {
+        ROCM_IMAGE = "rocm/dev-ubuntu-24.04:6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078"
+    }
     tags = [
         "${REGISTRY}/${OWNER}/${REPO}-rocm:${VERSION}-amd64"
     ]

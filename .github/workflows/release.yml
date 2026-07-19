@@ -26,7 +26,7 @@
 # ever lacks block-mode support, without weakening the amd64 legs.
 #
 # NOTE ON THE TRIVY GATE / BREAK-GLASS: the gate fails a leg on any *fixable*
-# CRITICAL (ignore-unfixed: true). Because the CUDA/ROCm bases are digest-pinned
+# CRITICAL (ignore-unfixed: true). Because the CUDA/CPU/ROCm bases are digest-pinned
 # in docker-bake.hcl but Trivy's vuln DB refreshes every run, a release that
 # passes today can fail weeks later with no code change once upstream ships a fix
 # the frozen base has not taken. Recovery / break-glass, in order of preference:
@@ -76,6 +76,11 @@ jobs:
       version: ${{ steps.get-version.outputs.version }}
       version_tag: ${{ steps.get-version.outputs.version_tag }}
       source_ref: ${{ steps.resolve-ref.outputs.source_ref }}
+      # Immutable commit the whole run builds/scans/attests/tags. Every
+      # downstream checkout, OCI revision label, and the GitHub Release's
+      # target_commitish use this, so a branch advancing mid-run cannot make
+      # jobs disagree about which commit they published.
+      source_sha: ${{ steps.resolve-sha.outputs.source_sha }}
       # One build timestamp for the whole run, so the scanned image, the pushed
       # per-arch images, and the index annotations all share an identical
       # org.opencontainers.image.created value (bit-identical scan vs push).
@@ -115,6 +120,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Pin the run to the exact commit the branch resolved to right now.
+      - name: Resolve source commit SHA
+        id: resolve-sha
+        run: |
+          set -euo pipefail
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Get version from VERSION file
         id: get-version
         env:
@@ -143,7 +155,9 @@ jobs:
           TAG_NAME: ${{ steps.get-version.outputs.version_tag }}
         run: |
           set -euo pipefail
-          git fetch --tags
+          # No `git fetch --tags` here: the checkout above uses fetch-depth: 0,
+          # which already fetched all tags, and persist-credentials: false means
+          # a fresh fetch would run unauthenticated (and fail on a private repo).
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "::error::Tag $TAG_NAME already exists. Please increment the version in the VERSION file."
             exit 1
@@ -165,7 +179,7 @@ jobs:
       BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
       VERSION: ${{ needs.prepare-release.outputs.version_tag }}
       REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
       REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
       # Local-only tag used to load the built image for scanning. Never pushed;
       # the real (bake-defined) tags are used by the separate --push step.
@@ -262,7 +276,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ needs.prepare-release.outputs.source_ref }}
+          ref: ${{ needs.prepare-release.outputs.source_sha }}
           persist-credentials: false
 
       - name: Free disk space
@@ -301,7 +315,7 @@ jobs:
       - name: Build image locally for scanning
         id: build_scan
         env:
-          REVISION: ${{ github.sha }}
+          REVISION: ${{ needs.prepare-release.outputs.source_sha }}
           CREATED: ${{ needs.prepare-release.outputs.created }}
           PLATFORM: ${{ matrix.platform }}
           BUILD_TARGET: ${{ matrix.build_target }}
@@ -335,6 +349,7 @@ jobs:
       # even when the gate above failed so the findings are always visible.
       - name: Trivy scan (SARIF report)
         if: always() && steps.build_scan.outcome == 'success'
+        continue-on-error: true  # reporting is non-blocking; must not skip the push
         uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # v0.34.0
         with:
           image-ref: ${{ env.SCAN_IMAGE }}
@@ -344,6 +359,7 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: always() && hashFiles('trivy-results.sarif') != ''
+        continue-on-error: true  # a Code Scanning outage must not block a gated-clean release
         uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
         with:
           sarif_file: trivy-results.sarif
@@ -367,7 +383,7 @@ jobs:
       # label is bit-identical to the scanned image's.
       - name: Build and push
         env:
-          REVISION: ${{ github.sha }}
+          REVISION: ${{ needs.prepare-release.outputs.source_sha }}
           CREATED: ${{ needs.prepare-release.outputs.created }}
           PLATFORM: ${{ matrix.platform }}
           BUILD_TARGET: ${{ matrix.build_target }}
@@ -404,7 +420,7 @@ jobs:
         build_target: ["cpu", "gpu", "gpu-cu128", "rocm"]
     env:
       REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
       REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
     steps:
       # egress: GHCR (manifest read/write + attestation push), GitHub (syft
@@ -440,6 +456,7 @@ jobs:
           VERSION_TAG: ${{ needs.prepare-release.outputs.version_tag }}
           TARGET: ${{ matrix.build_target }}
           CREATED: ${{ needs.prepare-release.outputs.created }}
+          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
         run: |
           set -euo pipefail
 
@@ -503,7 +520,7 @@ jobs:
           # Common index annotations. `index:` is required so these land on the
           # index manifest itself, not on per-platform descriptors inside it.
           SOURCE_URL="https://github.com/${OWNER}/Kokoro-FastAPI"
-          REVISION="${GITHUB_SHA}"
+          REVISION="${SOURCE_SHA}"
           ANNOTATIONS=(
             --annotation "index:org.opencontainers.image.title=${TITLE}"
             --annotation "index:org.opencontainers.image.description=${DESCRIPTION}"
@@ -587,7 +604,7 @@ jobs:
       packages: write
     env:
       REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
-      OWNER: ${{ vars.OWNER || 'remsky' }}
+      OWNER: ${{ vars.OWNER || 'fieldnote-echo' }}
       REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
       VERSION_TAG: ${{ needs.prepare-release.outputs.version_tag }}
     steps:
@@ -695,12 +712,17 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.prepare-release.outputs.version_tag }}
-          target_commitish: ${{ needs.prepare-release.outputs.source_ref }}
+          target_commitish: ${{ needs.prepare-release.outputs.source_sha }}
           name: Release ${{ needs.prepare-release.outputs.version_tag }}
           body: |
             Curated summary: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.prepare-release.outputs.version_tag }}/CHANGELOG.md)
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # A suffixed version_tag (branch build via workflow_dispatch, or a
+          # prerelease VERSION like 1.2.3-rc1) contains a '-'; mark those as
+          # prereleases so a non-stable build never becomes the user-facing
+          # "Latest release" — matching promote-latest, which likewise leaves
+          # the container :latest tags on the previous stable build.
+          prerelease: ${{ contains(needs.prepare-release.outputs.version_tag, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
