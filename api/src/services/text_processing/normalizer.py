@@ -170,7 +170,10 @@ URL_PATTERN = re.compile(
     # run (O(n^2) — a 100KB run of 'a' hung the normalizer). The domain run
     # is also bounded at 253 chars, the DNS name length limit.
     r"(?<![a-zA-Z0-9.-])"
-    r"(https?://|www\.|)+(localhost|[a-zA-Z0-9.-]{1,253}(\.(?:"
+    # Optional scheme/host prefix. Written as two optionals rather than
+    # (https?://|www\.|)+ — a '+' over a group with an empty alternative is a
+    # ReDoS smell and needlessly non-deterministic.
+    r"(?:https?://)?(?:www\.)?(localhost|[a-zA-Z0-9.-]{1,253}(\.(?:"
     + "|".join(VALID_TLDS)
     + r"))+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:[0-9]+)?([/?][^\s]*)?",
     re.IGNORECASE,
@@ -325,27 +328,33 @@ def handle_markdown(text: str) -> str:
     text = _MD_BLOCKQUOTE.sub("", text)
     # Horizontal rules — remove entire line
     text = _MD_HORIZONTAL_RULE.sub("", text)
-    # Tables — remove separator rows, replace pipes with spaces on table
-    # rows. A row must have 2+ pipes AND either be pipe-anchored (leading or
-    # trailing |) or sit next to a separator row; prose pipes like
-    # "either a | b | c works" stay intact.
-    # Escaped pipes (\|) are literal content — hide them from the table
-    # logic, then restore as bare pipes at the end.
+    # Tables — remove separator rows and de-pipe the table body. A real table
+    # is a separator row (|---|---|) plus the contiguous pipe-bearing lines
+    # above and below it; propagate table status outward from each separator
+    # row. This catches borderless multi-row and 2-column tables (which the old
+    # "2+ pipes AND anchored/adjacent" heuristic missed) while leaving a lone
+    # prose line with pipes — "either a | b | c works", no adjacent separator —
+    # untouched. Escaped pipes (\|) are hidden as a sentinel first so they are
+    # neither counted as table syntax nor de-piped, then restored at the end.
     text = text.replace("\\|", "\x00EP\x00")
     lines = text.split("\n")
     is_sep_row = [_is_table_sep_row(line) for line in lines]
+    is_table_row = [False] * len(lines)
+    for i, sep in enumerate(is_sep_row):
+        if not sep:
+            continue
+        j = i - 1
+        while j >= 0 and "|" in lines[j]:
+            is_table_row[j] = True
+            j -= 1
+        j = i + 1
+        while j < len(lines) and "|" in lines[j]:
+            is_table_row[j] = True
+            j += 1
     for i, line in enumerate(lines):
         if is_sep_row[i]:
             lines[i] = ""
-            continue
-        if line.count("|") < 2:
-            continue
-        stripped = line.strip()
-        pipe_anchored = stripped.startswith("|") or stripped.endswith("|")
-        near_sep_row = (i > 0 and is_sep_row[i - 1]) or (
-            i + 1 < len(lines) and is_sep_row[i + 1]
-        )
-        if pipe_anchored or near_sep_row:
+        elif is_table_row[i]:
             lines[i] = line.replace("|", " ")
     text = "\n".join(lines).replace("\x00EP\x00", "|")
 
